@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Bill Generator</title>
+    <!-- SheetJS for Excel handling -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <link rel="stylesheet" href="./style.css">
+</head>
+
+<body>
+    <div class="container">
+        <div class="tab-bar">
+            <button class="tab-btn active" data-tab="upi">UPI Bills</button>
+            <button class="tab-btn" data-tab="cash">Cash Bills</button>
+        </div>
+        <div id="tab-upi" class="tab-content active">
+            <h1>Automated Sales Bill Generator (UPI Bills)</h1>
+            <p>Upload your stock and bill amount files to generate sales bills.</p>
+            <label>
+                Bill Number Prefix:
+                <input type="text" id="billPrefix" placeholder="e.g. BILL" value="BILL">
+            </label>
+            <br><br>
+            <label>
+                Start Index:
+                <input type="number" id="startIndex" placeholder="e.g. 1" value="1">
+            </label>
+            <br><br>
+            <label>
+                Upload Stock File:
+                <input type="file" id="stockInput" accept=".xlsx, .xls">
+            </label>
+            <br><br>
+            <label>
+                Upload Bill Amount File:
+                <input type="file" id="billInput" accept=".xlsx, .xls">
+            </label>
+            <br><br>
+            <button id="generateBtn" disabled>Generate Bills</button>
+        </div>
+        
+        <div id="tab-cash" class="tab-content">
+            <h1>Cash Bills (Date Planner)</h1>
+            <p>Define stock, date range, and daily target sales amount to generate bills.</p>
+            
+            <label>
+                Bill Number Prefix:
+                <input type="text" id="cashStockPrefix" placeholder="e.g. BILL" value="BILL">
+            </label>
+            <br><br>
+            <label>
+                Start Index:
+                <input type="number" id="cashBillStartIndex" placeholder="e.g. 1" value="1">
+            </label>
+            <br><br>
+            <div class="date-range-inputs">
+                <label>
+                    Date Range:
+                    <input type="date" id="cashStartDate"> to <input type="date" id="cashEndDate">
+                </label>
+            </div>
+            
+            <div id="dateAmountTableContainer" class="table-container">
+                <!-- Date/Amount table will be generated here -->
+            </div>
+            <br>
+            
+            <label>
+                Bill Total Range (for individual bills):
+                <input type="number" id="cashMinBill" placeholder="Min Bill Total"> to <input type="number" id="cashMaxBill"
+                    placeholder="Max Bill Total">
+            </label>
+            <br><br>
+            
+            <label>
+                Upload Stock File:
+                <input type="file" id="cashStockInput" accept=".xlsx, .xls">
+            </label>
+            <br><br>
+            
+            <!-- NEW PURCHASER NAME INPUT -->
+            <label>
+                Upload Purchaser Names File:
+                <input type="file" id="purchaserNamesInput" accept=".xlsx, .xls">
+            </label>
+            <br><br>
+            <!---------------------------->
+
+            <button id="generateCashBtn" disabled>Generate Cash Bills</button>
+        </div>
+    </div>
+    <script src="./index.js"></script>
+</body>
+
+</html>
