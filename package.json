@@ -1,0 +1,20 @@
+{
+    "name": "automated-sales-bill-generator",
+    "version": "1.0.0",
+    "description": "A tool for generating sales bills and updating stock based on targets.",
+    "main": "index.js",
+    "scripts": {
+      "start": "live-server ./",
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+      "excel",
+      "automation",
+      "sales"
+    ],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+      "live-server": "^1.2.2"
+    }
+  }
