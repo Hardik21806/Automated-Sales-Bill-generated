@@ -1,3 +1,11 @@
+// Utility function to shuffle an array (Fisher-Yates algorithm)
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+}
+
 function calculateItemTotal(price, qty, gstPercent, cessPercent, mrp) {
     const base = price * qty;
     const gstTax = (base * gstPercent) / 100;
@@ -209,6 +217,13 @@ function exportBillsToExcel(bills, filename = "generated-bills.xlsx", billPrefix
     // Create a list of names to cycle through for cash bills
     // Note: UPI bills (which use this function too) won't have purchaser data, so we only use the global list if it's populated.
     const namesToAssign = purchaserNames.length > 0 && paymentMethod === "Cash" ? [...purchaserNames] : ['N/A'];
+    
+    // START FIX: Shuffle the purchaser names list for true randomness
+    if (paymentMethod === "Cash" && namesToAssign.length > 1) {
+        shuffleArray(namesToAssign);
+    }
+    // END FIX
+
     const totalNames = namesToAssign.length;
     
     // Reset counter for a fresh generation
@@ -216,7 +231,7 @@ function exportBillsToExcel(bills, filename = "generated-bills.xlsx", billPrefix
     
     bills.forEach((bill, index) => {
         // Assign a name to the entire bill
-        // This cycles through the names list to ensure even distribution
+        // This cycles through the shuffled list
         const billPurchaserName = namesToAssign[purchaserIndexCounter % totalNames];
         purchaserIndexCounter++;
         
@@ -621,8 +636,6 @@ document.addEventListener("DOMContentLoaded", () => {
     updateGenerateCashButtonState();
 
     // Simple tab switching logic
-
-
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.onclick = function () {
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
