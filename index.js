@@ -25,7 +25,7 @@ function buildStockMap(data) {
     return map;
 }
 
-/** ======== Bill Generation Logic (same as previous) ======== */
+/** ======== Bill Generation Logic ======== */
 let lastStartIndex = 0;
 let billCounter = 0;
 
@@ -39,8 +39,12 @@ function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
     billCounter++;
 
     const RESET_INTERVAL = 5; // every 5 bills
+    // Filter out items where the unit price is extremely low, 
+    // to help meet the minimum contribution.
+    const MIN_UNIT_PRICE = 50; 
+    
     const allItems = Array.from(stockMap.entries())
-        .filter(([_, item]) => item.remainingQty > 0)
+        .filter(([_, item]) => item.remainingQty > 0 && item["Price"] >= MIN_UNIT_PRICE)
         .sort((a, b) => b[1]["Amount"] - a[1]["Amount"]);
 
     const itemCount = allItems.length;
@@ -96,11 +100,24 @@ function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
         let qty = 1;
         let selectedQty = 0;
 
+        // NEW LOGIC: Enforce a minimum contribution per item
+        const MIN_ITEM_CONTRIBUTION = 200;
+        const minContributionForThisItem = Math.min(MIN_ITEM_CONTRIBUTION, remainingTarget);
+        
+        // Calculate the minimum quantity needed to meet the minimum contribution
+        const minQtyToMeetContribution = Math.ceil(minContributionForThisItem / unitPrice);
+        
+        // Start checking quantity from the minimum required to meet the contribution
+        qty = Math.max(1, minQtyToMeetContribution);
+
+
         while (qty <= maxQty) {
             const itemTotal = calculateItemTotal(unitPrice, qty, gstPercent, cessPercent, mrp);
             
+            // 1. Hard stop if the item pushes the bill over budget plus margin
             if (total + itemTotal > targetAmount + margin) break;
             
+            // 2. Prefer quantities where the total contribution is less than or around the ideal share.
             if (itemTotal <= idealContribution * 1.5 || result.length === 0) {
                  selectedQty = qty;
             } else {
@@ -113,6 +130,13 @@ function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
         if (finalQty > 0) {
             let finalItemTotal = calculateItemTotal(unitPrice, finalQty, gstPercent, cessPercent, mrp);
             
+            // Re-check: Ensure the final item total contributes at least the minimum, unless it's the last item and remaining target is low.
+            if (finalItemTotal < minContributionForThisItem && result.length < expectedItems - 1) {
+                // If the selected quantity is too low and it's not the final item, skip or increase Qty.
+                finalQty = 0; // Skip this item this cycle
+            }
+
+            // Safety break if one item satisfies the whole bill (shouldn't happen with the new logic, but helps prevent overshoot)
             if (finalQty === 1 && total + finalItemTotal > targetAmount + margin) {
                 finalQty = 0; 
             } else if (total + finalItemTotal > targetAmount + margin) {
@@ -152,7 +176,6 @@ function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
         if (startIndex === 0) {
             looped = true; 
             // The check below still uses the minimum number of items derived from the target amount
-            // which is now guaranteed to be 3 or higher.
             if (result.length < minItems && Math.abs(total - targetAmount) > targetAmount * 0.1) {
                 looped = false; 
             }
@@ -167,7 +190,6 @@ function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
 }
 /** ======== End Bill Generation Logic ======== */
 
-// ... (exportUpdatedStockToXLSX, generateBillNumber, formatDate - functions remain the same) ...
 function exportUpdatedStockToXLSX(stockMap, filename = "updated-stock.xlsx") {
     const updatedStock = [];
 
@@ -290,6 +312,16 @@ function exportBillsToExcel(bills, filename = "generated-bills.xlsx", billPrefix
     XLSX.writeFile(wb, filename);
 }
 
+// Function to format date from YYYY-MM-DD to DD/MM/YYYY
+function formatDisplayDate(dateStr) {
+    if (!dateStr || dateStr.length !== 10) return dateStr;
+    const parts = dateStr.split('-');
+    // Assuming YYYY-MM-DD format
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+}
+
+
+// Function to format date for use in filenames (existing logic)
 function formatDate(dateInput) {
     const date = new Date(dateInput);
 
@@ -348,6 +380,7 @@ function generateDateTable() {
     // Rebuild dateAmountTargets, retaining existing amounts if dates match
     const newDateAmountTargets = [];
     let tableHtml = '<table class="date-amount-table"><thead><tr><th>Date</th><th>Daily Target Amount (₹)</th></tr></thead><tbody>';
+    let totalSum = 0;
 
     validDates.forEach(dateStr => {
         // Try to find if this date already existed in the previous array to keep the amount
@@ -355,11 +388,12 @@ function generateDateTable() {
         const amount = existingTarget ? existingTarget.targetAmount : 0;
         
         newDateAmountTargets.push({ date: dateStr, targetAmount: amount });
+        totalSum += amount;
         
-        // Generate table row HTML
+        // Generate table row HTML, using formatDisplayDate for DD/MM/YYYY view
         tableHtml += `
             <tr>
-                <td>${dateStr}</td>
+                <td>${formatDisplayDate(dateStr)}</td>
                 <td>
                     <input type="number" 
                            data-date="${dateStr}" 
@@ -372,12 +406,30 @@ function generateDateTable() {
         `;
     });
     
+    // Add the total sum row
+    tableHtml += `
+        <tr class="total-row">
+            <td><strong>TOTAL SUM:</strong></td>
+            <td><strong id="totalDailySum">${totalSum.toFixed(2)}</strong></td>
+        </tr>
+    `;
+    
     tableHtml += '</tbody></table>';
 
     // Update the DOM and the global state
     tableContainer.innerHTML = tableHtml;
     dateAmountTargets = newDateAmountTargets;
 
+    // Function to update the total sum displayed in the table
+    function updateTableTotal() {
+        let currentTotal = 0;
+        dateAmountTargets.forEach(t => { currentTotal += t.targetAmount; });
+        const totalElement = document.getElementById("totalDailySum");
+        if (totalElement) {
+            totalElement.textContent = currentTotal.toFixed(2);
+        }
+    }
+    
     // Attach event listeners to the new input fields
     document.querySelectorAll('.daily-target-input').forEach(input => {
         input.oninput = function() {
@@ -388,6 +440,7 @@ function generateDateTable() {
             if (target) {
                 target.targetAmount = targetAmount;
             }
+            updateTableTotal();
             updateGenerateCashButtonState();
         };
     });
