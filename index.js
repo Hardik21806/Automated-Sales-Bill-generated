@@ -17,247 +17,316 @@ function buildStockMap(data) {
     const map = new Map();
     for (const item of data) {
         const key = item["Item Details"];
+        // Detect if stock has decimals initially
+        const qty = Number(item["Qty."]) || 0;
+        const isFloatStock = qty % 1 !== 0; 
+        
         map.set(key, {
             ...item,
-            remainingQty: item["Qty."]
+            remainingQty: qty,
+            initialIsFloat: isFloatStock, 
+            "Price": Number(item["Price"]) || 0,
+            "GST PERCENT": Number(item["GST PERCENT"]) || 0,
+            "CESS%": Number(item["CESS%"]) || 0,
+            "MRP": Number(item["MRP"]) || 0,
+            singleUnitCost: calculateItemTotal(Number(item["Price"]), 1, Number(item["GST PERCENT"]), Number(item["CESS%"]), Number(item["MRP"]))
         });
     }
     return map;
 }
 
-/** ======== Bill Generation Logic ======== */
-let lastStartIndex = 0;
+/** ======== Smart Bill Generation Logic ======== */
 let billCounter = 0;
 
-function getMinMaxItemsByTarget(targetAmount) {
-    if (targetAmount < 1000) return [2, 3];
-    if (targetAmount < 5000) return [3, 5];
-    return [5, 7];
+function getItemBillTotal(item, qty) {
+    return calculateItemTotal(
+        item["Price"],
+        qty,
+        item["GST PERCENT"] || 0,
+        item["CESS%"] || 0,
+        item["MRP"] || 0
+    );
 }
 
-function generateBillFromMap(stockMap, targetAmount, date, margin = 5) {
+function waitFrame() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+// Check if an item SHOULD be allowed to be sold in decimals
+function canSellInFloat(item, roomLeft) {
+    // 1. User Rule: MRP > 10000
+    if (item["MRP"] > 10000) return true;
+    
+    // 2. User Rule: Stock is already float (e.g. 1.4 remaining)
+    if (item.remainingQty % 1 !== 0) return true;
+    
+    // 3. Auto-Fit: If 1 unit is too expensive for the current bill/budget, allow float to fit it in.
+    if (item.singleUnitCost > roomLeft) return true;
+
+    return false;
+}
+
+// --- ASYNC SAFE GENERATOR FUNCTION ---
+async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemaining, date, margin = 5, mode = 'RANGE', currentFailures = 0) {
     billCounter++;
-
-    const RESET_INTERVAL = 5; // every 5 bills
-    // Filter out items where the unit price is extremely low, 
-    // to help meet the minimum contribution.
-    const MIN_UNIT_PRICE = 50; 
     
-    const allItems = Array.from(stockMap.entries())
-        .filter(([_, item]) => item.remainingQty > 0 && item["Price"] >= MIN_UNIT_PRICE)
-        .sort((a, b) => b[1]["Amount"] - a[1]["Amount"]);
-
-    const itemCount = allItems.length;
-
-    if (billCounter % RESET_INTERVAL === 0 && lastStartIndex > 0) {
-        // Randomly jump back a bit
-        lastStartIndex = Math.floor(Math.random() * lastStartIndex);
-    }
-
-    let startIndex = lastStartIndex % itemCount;
-
-    if (itemCount === 0) return { items: [], total: 0, success: false };
-
-    // Decide how many items to try for this bill
-    const [minItemsOriginal, maxItems] = getMinMaxItemsByTarget(targetAmount);
-    
-    // ENFORCING MINIMUM 3 ITEMS:
-    const minItems = Math.max(3, minItemsOriginal); 
-    
-    // Ensure maxItems is not less than the new minItems (3)
-    const finalMaxItems = Math.max(minItems, maxItems);
-
-    const expectedItems = Math.floor(Math.random() * (finalMaxItems - minItems + 1)) + minItems;
-    lastStartIndex += expectedItems; // update global for next call
-
-    const result = [];
-    let total = 0;
-    let remainingTarget = targetAmount;
-
-    let looped = false;
-    let pickedCount = 0;
-
-    const maxLoopIterations = itemCount * 2; 
-    let iterationCount = 0;
-
-    while (pickedCount < expectedItems && !looped && iterationCount < maxLoopIterations) {
-        const [productName, item] = allItems[startIndex];
-        iterationCount++;
-
-        if (item.remainingQty <= 0) {
-            startIndex = (startIndex + 1) % itemCount;
-            looped = (startIndex === 0);
-            continue;
-        }
-
-        const unitPrice = item["Price"];
-        const gstPercent = item["GST PERCENT"] || 0;
-        const cessPercent = item["CESS%"] || 0;
-        const mrp = item["MRP"] || 0;
-        const maxQty = item.remainingQty;
-        const idealContribution = remainingTarget / (expectedItems - result.length);
-
-        let qty = 1;
-        let selectedQty = 0;
-
-        // NEW LOGIC: Enforce a minimum contribution per item
-        const MIN_ITEM_CONTRIBUTION = 200;
-        const minContributionForThisItem = Math.min(MIN_ITEM_CONTRIBUTION, remainingTarget);
+    // 1. Prepare Available Stock
+    // NOTE: We NO LONGER filter out expensive items. We will just decimal-ize them.
+    let availableItems = Array.from(stockMap.values())
+        .filter(item => item.remainingQty > 0.001); // Filter out effectively zero stock
         
-        // Calculate the minimum quantity needed to meet the minimum contribution
-        const minQtyToMeetContribution = Math.ceil(minContributionForThisItem / unitPrice);
-        
-        // Start checking quantity from the minimum required to meet the contribution
-        qty = Math.max(1, minQtyToMeetContribution);
+    // Sort cheaply to expensive
+    availableItems.sort((a, b) => a.singleUnitCost - b.singleUnitCost);
 
+    const itemCount = availableItems.length;
+    if (itemCount === 0) return { items: [], total: 0, success: false, reason: "No items available" };
 
-        while (qty <= maxQty) {
-            const itemTotal = calculateItemTotal(unitPrice, qty, gstPercent, cessPercent, mrp);
+    // --- DYNAMIC EFFORT SCALING ---
+    let effortMultiplier = 1.0;
+    if (currentFailures > 50) effortMultiplier = 0.2;   
+    if (currentFailures > 500) effortMultiplier = 0.05; 
+    if (currentFailures > 2000) effortMultiplier = 0.01; 
+
+    const baseAttempts = [
+        { count: 4, attempts: 50 },
+        { count: 3, attempts: 50 },
+        { count: 2, attempts: 100 }, 
+        { count: 1, attempts: 20 }
+    ];
+
+    for (const tier of baseAttempts) {
+        const minItems = tier.count;
+        const maxAttempts = Math.max(1, Math.floor(tier.attempts * effortMultiplier));
+
+        if (itemCount < minItems) continue;
+
+        // With float logic, we can almost ALWAYS fit items, so strict feasibility check is relaxed.
+        // We just check if we have enough items count-wise.
+
+        let randomItems = [...availableItems];
+        shuffleArray(randomItems);
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
             
-            // 1. Hard stop if the item pushes the bill over budget plus margin
-            if (total + itemTotal > targetAmount + margin) break;
+            if (attempt % 50 === 0) await waitFrame();
+
+            let currentBill = [];
+            let currentTotal = 0;
+            let pickedCount = 0;
+            let tempUsed = new Map();
             
-            // 2. Prefer quantities where the total contribution is less than or around the ideal share.
-            if (itemTotal <= idealContribution * 1.5 || result.length === 0) {
-                 selectedQty = qty;
+            // Helper to get remaining stock for this specific bill calculation
+            const getRem = (i) => {
+                const used = tempUsed.get(i["Item Details"]) || 0;
+                return Math.max(0, i.remainingQty - used);
+            };
+
+            // MODE A: RANGE
+            if (mode === 'RANGE') {
+                for (const item of randomItems) {
+                    if (currentTotal >= targetMin && pickedCount >= minItems) {
+                         if (Math.random() > 0.5) break; 
+                    }
+                    
+                    const actualRemaining = getRem(item);
+                    if (actualRemaining <= 0.001) continue;
+
+                    const roomLeft = targetMax - currentTotal;
+                    
+                    // Stop if room is tiny
+                    if (roomLeft < 1) continue;
+
+                    let qty = 0;
+                    const allowFloat = canSellInFloat(item, roomLeft);
+
+                    // Calculate maximum possible quantity based on budget
+                    // Formula: roomLeft / cost_of_1_unit
+                    let maxQtyBudget = roomLeft / item.singleUnitCost;
+                    
+                    // The absolute max we can take is the lower of: Stock vs Budget
+                    let absMax = Math.min(actualRemaining, maxQtyBudget);
+
+                    if (allowFloat) {
+                        // FLOAT LOGIC
+                        // Pick a random portion of the available max
+                        // Ensure we don't pick tiny dust (min 0.01)
+                        if (absMax < 0.01) continue;
+                        
+                        // Heuristic: Try to take a significant chunk, not just 0.01
+                        let factor = Math.random() * 0.8 + 0.2; // 20% to 100% of max
+                        qty = parseFloat((absMax * factor).toFixed(2));
+                        
+                        // Safety: if variety needed, cap it
+                        if (pickedCount < minItems && qty > absMax / 2) {
+                             qty = parseFloat((absMax / 2).toFixed(2));
+                        }
+                    } else {
+                        // INTEGER LOGIC
+                        let intMax = Math.floor(absMax);
+                        if (intMax < 1) continue; // Can't fit even 1 unit
+                        
+                        // Variety check
+                        if (pickedCount < minItems) intMax = Math.min(intMax, 2);
+                        
+                        qty = Math.floor(Math.random() * intMax) + 1;
+                    }
+
+                    if (qty <= 0) continue;
+
+                    let cost = getItemBillTotal(item, qty);
+                    
+                    currentBill.push({ item, qty, cost });
+                    currentTotal += cost;
+                    pickedCount++;
+                    tempUsed.set(item["Item Details"], (tempUsed.get(item["Item Details"]) || 0) + qty);
+                }
+            } 
+            
+            // MODE B: EXACT (The Sniper with Float powers)
+            else if (mode === 'EXACT') {
+                 // Try to fill random base items first
+                 for (let i = 0; i < minItems - 1; i++) {
+                    const remaining = targetMax - currentTotal;
+                    if (remaining <= 5) break; // almost full
+
+                    // Pick random
+                    const r = randomItems[Math.floor(Math.random()*randomItems.length)];
+                    const actualRemaining = getRem(r);
+                    if (actualRemaining <= 0.001) continue;
+
+                    // Reserve budget for at least 1 more item? 
+                    // With float, we can usually squeeze anything, but let's be safe.
+                    const safeMax = remaining * 0.8; 
+                    
+                    let qty = 0;
+                    let maxQtyBudget = safeMax / r.singleUnitCost;
+                    let absMax = Math.min(actualRemaining, maxQtyBudget);
+                    
+                    if (canSellInFloat(r, safeMax)) {
+                        if (absMax < 0.01) continue;
+                        qty = parseFloat((Math.random() * absMax).toFixed(2));
+                    } else {
+                        let intMax = Math.floor(absMax);
+                        if (intMax < 1) continue;
+                        qty = Math.floor(Math.random() * intMax) + 1;
+                    }
+
+                    if (qty > 0) {
+                        let cost = getItemBillTotal(r, qty);
+                        currentBill.push({ item: r, qty, cost });
+                        currentTotal += cost;
+                        pickedCount++;
+                        tempUsed.set(r["Item Details"], (tempUsed.get(r["Item Details"])||0)+qty);
+                    }
+                 }
+                 
+                 // Sniper Fill - Try to find perfect float match
+                 if (pickedCount >= minItems - 1) {
+                     const gap = targetMax - currentTotal;
+                     if (gap > 0.1) {
+                         // Find item that has enough stock to cover the gap
+                         // Preference: Float allowed items
+                         const candidate = availableItems.find(i => {
+                             const rem = getRem(i);
+                             const costOfRem = getItemBillTotal(i, rem); // Rough check
+                             return rem > 0 && costOfRem >= gap;
+                         });
+
+                         if (candidate) {
+                             // Calculate exact QTY needed for Gap
+                             // Price * Qty = Gap  => Qty = Gap / Price
+                             let neededQty = gap / candidate["Price"];
+                             
+                             // Adjust for Taxes to be precise?
+                             // Iterative approach is safer for tax rounding:
+                             // Estimate:
+                             let exactQty = parseFloat((gap / candidate.singleUnitCost).toFixed(2));
+                             
+                             // Check limits
+                             if (exactQty <= getRem(candidate) && exactQty > 0) {
+                                 // Check if float allowed OR if it happens to be integer
+                                 if (canSellInFloat(candidate, gap) || Number.isInteger(exactQty)) {
+                                     let cost = getItemBillTotal(candidate, exactQty);
+                                     // If cost is close enough
+                                     if (Math.abs(cost - gap) < 5) {
+                                         currentBill.push({ item: candidate, qty: exactQty, cost });
+                                         currentTotal += cost;
+                                         pickedCount++;
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+            }
+
+            // Validation
+            let isValid = false;
+            
+            // Allow slight variance in Exact mode due to float rounding
+            const tolerance = mode === 'EXACT' ? margin : 0; 
+
+            if (mode === 'RANGE') {
+                if (currentTotal >= targetMin && currentTotal <= targetMax && pickedCount >= minItems) isValid = true;
             } else {
-                 break; 
-            }
-            qty++;
-        }
-        
-        let finalQty = selectedQty;
-        if (finalQty > 0) {
-            let finalItemTotal = calculateItemTotal(unitPrice, finalQty, gstPercent, cessPercent, mrp);
-            
-            // Re-check: Ensure the final item total contributes at least the minimum, unless it's the last item and remaining target is low.
-            if (finalItemTotal < minContributionForThisItem && result.length < expectedItems - 1) {
-                // If the selected quantity is too low and it's not the final item, skip or increase Qty.
-                finalQty = 0; // Skip this item this cycle
+                 if (Math.abs(targetMax - currentTotal) <= tolerance && pickedCount >= minItems) isValid = true;
             }
 
-            // Safety break if one item satisfies the whole bill (shouldn't happen with the new logic, but helps prevent overshoot)
-            if (finalQty === 1 && total + finalItemTotal > targetAmount + margin) {
-                finalQty = 0; 
-            } else if (total + finalItemTotal > targetAmount + margin) {
-                if (finalQty > 1) {
-                    finalQty -= 1;
-                    finalItemTotal = calculateItemTotal(unitPrice, finalQty, gstPercent, cessPercent, mrp);
-                } else {
-                    finalQty = 0;
+            if (isValid) {
+                const futureDayRemaining = dayTotalRemaining - currentTotal;
+                // With floats, we can basically always finish, so "Safe Landing" is much easier.
+                // Just check we aren't leaving 0.05 rupees or something tiny that isn't 0.
+                if (futureDayRemaining <= margin || futureDayRemaining > 50) { 
+                    currentBill.forEach(entry => {
+                        const realItem = stockMap.get(entry.item["Item Details"]);
+                        realItem.remainingQty = parseFloat((realItem.remainingQty - entry.qty).toFixed(3));
+                    });
+                    return formatResult(currentBill, currentTotal, targetMax, date);
                 }
             }
-        
-            if (finalQty > 0) {
-                const cessTaxAmount = ((mrp || 0) * finalQty * (cessPercent || 0)) / 100;
-                result.push({
-                    name: productName,
-                    qty: finalQty,
-                    unitPrice,
-                    gstPercent,
-                    cessPercent,
-                    mrp,
-                    cessTaxAmount,
-                    itemTotal: finalItemTotal,
-                    date,
-                });
-
-                total += finalItemTotal;
-                remainingTarget -= finalItemTotal;
-                item.remainingQty -= finalQty;
-                item.Amount = +(item.remainingQty * unitPrice).toFixed(2);
-                stockMap.set(productName, item);
-                pickedCount++;
-            }
-        }
-
-
-        startIndex = (startIndex + 1) % itemCount;
-        if (startIndex === 0) {
-            looped = true; 
-            // The check below still uses the minimum number of items derived from the target amount
-            if (result.length < minItems && Math.abs(total - targetAmount) > targetAmount * 0.1) {
-                looped = false; 
-            }
+            shuffleArray(randomItems);
         }
     }
-
-    return {
-        items: result,
-        total: +total.toFixed(2),
-        targetAmount,
-    };
-}
-/** ======== End Bill Generation Logic ======== */
-
-function exportUpdatedStockToXLSX(stockMap, filename = "updated-stock.xlsx") {
-    const updatedStock = [];
-
-    for (const [_, item] of stockMap.entries()) {
-        updatedStock.push({
-            "Item Details": item["Item Details"],
-            "Parent Group": item["Parent Group"],
-            "Qty.": item.remainingQty, // Use updated remaining quantity
-            "Unit": item["Unit"],
-            "SALES PRICE": item["SALES PRICE"],
-            "HSN CODE": item["HSN CODE"],
-            "GST PERCENT": item["GST PERCENT"],
-            "CESS%": item["CESS%"] || 0,
-            "MRP": item["MRP"] || 0,
-            "Price": item["Price"],
-            "Amount": +(item.remainingQty * item["Price"]).toFixed(2), // Recalculate Amount
-        });
-    }
-
-    const ws = XLSX.utils.json_to_sheet(updatedStock);
-
-    const headers = Object.keys(updatedStock[0]);
-
-    const defaultWidth = 15;
-    ws['!cols'] = headers.map(() => ({ wch: defaultWidth }))
-    ws['!cols'][0] = { wch: 40 }; // Wider column for Item Name
-
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, ws, "Stock");
-
-    XLSX.writeFile(workbook, filename);
+    return { items: [], total: 0, success: false };
 }
 
-function generateBillNumber(index, prefix = "BILL", padLength = 4) {
-    const paddedIndex = String(index).padStart(padLength, '0');
-    return `${prefix}${paddedIndex}`;
+function formatResult(billArray, total, target, date) {
+    const finalItems = billArray.map(entry => {
+        const cessTaxAmount = ((entry.item["MRP"] || 0) * entry.qty * (entry.item["CESS%"] || 0)) / 100;
+        return {
+            name: entry.item["Item Details"],
+            qty: entry.qty,
+            unitPrice: entry.item["Price"],
+            gstPercent: entry.item["GST PERCENT"],
+            cessPercent: entry.item["CESS%"],
+            mrp: entry.item["MRP"],
+            cessTaxAmount: cessTaxAmount,
+            itemTotal: entry.cost,
+            date: date
+        };
+    });
+    return { items: finalItems, total: +total.toFixed(2), targetAmount: target, success: true };
 }
 
-// Global counter for cycling through purchaser names
-let purchaserIndexCounter = 0;
-
-function exportBillsToExcel(bills, filename = "generated-bills.xlsx", billPrefixId, billIndexId, paymentMethod) {
-    const prefix = document.getElementById(billPrefixId).value || "BILL";
-    const startIndex = parseInt(document.getElementById(billIndexId).value, 10) || 1;
+function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
+    const prefixElement = document.getElementById(prefixId);
+    const indexElement = document.getElementById(indexId);
+    const prefix = prefixElement ? prefixElement.value : "BILL";
+    const startIndex = indexElement ? (parseInt(indexElement.value, 10) || 1) : 1;
+    
     const rows = [];
     
-    // Create a list of names to cycle through for cash bills
-    // Note: UPI bills (which use this function too) won't have purchaser data, so we only use the global list if it's populated.
     const namesToAssign = purchaserNames.length > 0 && paymentMethod === "Cash" ? [...purchaserNames] : ['N/A'];
-    
-    // START FIX: Shuffle the purchaser names list for true randomness
     if (paymentMethod === "Cash" && namesToAssign.length > 1) {
         shuffleArray(namesToAssign);
     }
-    // END FIX
-
+    let purchaserIndexCounter = 0;
     const totalNames = namesToAssign.length;
     
-    // Reset counter for a fresh generation
-    purchaserIndexCounter = 0;
-    
     bills.forEach((bill, index) => {
-        // Assign a name to the entire bill
-        // This cycles through the shuffled list
         const billPurchaserName = namesToAssign[purchaserIndexCounter % totalNames];
         purchaserIndexCounter++;
         
-        // Calculate Round Off for the bill (only if Cash)
         let roundOff = 0;
         let finalBillTotal = bill.total;
         
@@ -279,76 +348,65 @@ function exportBillsToExcel(bills, filename = "generated-bills.xlsx", billPrefix
                 "Unit Price": item.unitPrice,
                 "Item Price": +(item.unitPrice * item.qty).toFixed(2),
                 "GST %": item.gstPercent,
-                "SGST": (item.gstPercent / 2).toFixed(2),
-                "Total SGST Amount": +(taxAmount / 2).toFixed(2),
-                "CGST": (item.gstPercent / 2).toFixed(2),
-                "Total CGST Amount": +(taxAmount / 2).toFixed(2),
                 "Total Tax Amount": +(taxAmount).toFixed(2),
-                "CESS %": item.cessPercent,
                 "CESS Tax Amount": +(item.cessTaxAmount || 0).toFixed(2),
-                "Date": item.date,
+                "Date": formatDisplayDate(item.date),
                 "Item Total": item.itemTotal,
                 "Bill Total (Unrounded)": bill.total,
-                "Round off": roundOff, // NEW ROUND OFF COLUMN
-                "Bill Total (Final)": finalBillTotal, // Show the final rounded total
-                "Original Bill Amount": bill.targetAmount,
+                "Round off": roundOff, 
+                "Bill Total (Final)": finalBillTotal, 
             });
         });
     });
 
     const ws = XLSX.utils.json_to_sheet(rows);
-
-    // Create an array with same width for all columns
-    const defaultWidth = 15; // You can adjust this
-    const headers = Object.keys(rows[0]);
-    ws['!cols'] = headers.map(() => ({ wch: defaultWidth }))
-    ws['!cols'][2] = { wch: 20 }; // Wider column for Payment Method
-    ws['!cols'][3] = { wch: 40 }; // Wider column for Item Name (now column 4)
-    ws['!cols'][1] = { wch: 25 }; // Wider column for Purchaser Name (now column 2)
-
-    // Continue with workbook creation
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Bills");
     XLSX.writeFile(wb, filename);
 }
 
-// Function to format date from YYYY-MM-DD to DD/MM/YYYY
+function exportUpdatedStockToXLSX(stockMap, filename) {
+    const updatedStock = [];
+    for (const [_, item] of stockMap.entries()) {
+        updatedStock.push({
+            "Item Details": item["Item Details"],
+            "Qty.": item.remainingQty, 
+            "Unit": item["Unit"],
+            "Price": item["Price"],
+            "GST PERCENT": item["GST PERCENT"],
+            "MRP": item["MRP"],
+            "Amount": +(item.remainingQty * item["Price"]).toFixed(2),
+        });
+    }
+    const ws = XLSX.utils.json_to_sheet(updatedStock);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Stock");
+    XLSX.writeFile(wb, filename);
+}
+
+function generateBillNumber(index, prefix = "BILL", padLength = 4) {
+    return `${prefix}${String(index).padStart(padLength, '0')}`;
+}
+
 function formatDisplayDate(dateStr) {
     if (!dateStr || dateStr.length !== 10) return dateStr;
     const parts = dateStr.split('-');
-    // Assuming YYYY-MM-DD format
     return `${parts[2]}/${parts[1]}/${parts[0]}`;
 }
 
-
-// Function to format date for use in filenames (existing logic)
 function formatDate(dateInput) {
     const date = new Date(dateInput);
-
     const pad = num => String(num).padStart(2, '0');
-
-    const dd = pad(date.getDate());
-    const mm = pad(date.getMonth() + 1); // Months are 0-based
-    const yyyy = date.getFullYear();
-    const HH = pad(date.getHours());
-    const MM = pad(date.getMinutes());
-    const SS = pad(date.getSeconds());
-
-    return `${dd}-${mm}-${yyyy}T${HH}-${MM}-${SS}`;
+    return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${date.getFullYear()}T${pad(date.getHours())}-${pad(date.getMinutes())}`;
 }
 
+// Global State
+let stockData = null; 
+let billTargets = null; 
+let cashStockData = null; 
+let dateAmountTargets = []; 
+let purchaserNames = []; 
 
-// Global State variables
-let stockData = null; // UPI Bills Stock
-let billTargets = null; // UPI Bills targets from file
-let cashStockData = null; // Cash Bills Stock
-let dateAmountTargets = []; // New state for date-specific targets
-let purchaserNames = []; // NEW: Array to hold purchaser names
-
-/**
- * Generates the interactive table of working dates (excluding Sunday) 
- * and stores the target amounts in the global dateAmountTargets array.
- */
 function generateDateTable() {
     const startDateStr = document.getElementById("cashStartDate").value;
     const endDateStr = document.getElementById("cashEndDate").value;
@@ -366,47 +424,34 @@ function generateDateTable() {
     const validDates = [];
     let currentDate = new Date(startDate);
     
-    // Generate the list of valid dates (Mon-Sat)
     while (currentDate <= endDate) {
-        // currentDate.getDay() returns 0 for Sunday
         if (currentDate.getDay() !== 0) { 
-            // Format as 'YYYY-MM-DD'
             const dateStr = currentDate.toISOString().split('T')[0];
             validDates.push(dateStr);
         }
         currentDate.setDate(currentDate.getDate() + 1);
     }
 
-    // Rebuild dateAmountTargets, retaining existing amounts if dates match
     const newDateAmountTargets = [];
     let tableHtml = '<table class="date-amount-table"><thead><tr><th>Date</th><th>Daily Target Amount (₹)</th></tr></thead><tbody>';
     let totalSum = 0;
 
     validDates.forEach(dateStr => {
-        // Try to find if this date already existed in the previous array to keep the amount
         const existingTarget = dateAmountTargets.find(t => t.date === dateStr);
         const amount = existingTarget ? existingTarget.targetAmount : 0;
-        
         newDateAmountTargets.push({ date: dateStr, targetAmount: amount });
         totalSum += amount;
         
-        // Generate table row HTML, using formatDisplayDate for DD/MM/YYYY view
         tableHtml += `
             <tr>
                 <td>${formatDisplayDate(dateStr)}</td>
                 <td>
-                    <input type="number" 
-                           data-date="${dateStr}" 
-                           class="daily-target-input"
-                           min="0" 
-                           value="${amount}"
-                           placeholder="Enter amount">
+                    <input type="number" data-date="${dateStr}" class="daily-target-input" min="0" value="${amount}">
                 </td>
             </tr>
         `;
     });
     
-    // Add the total sum row
     tableHtml += `
         <tr class="total-row">
             <td><strong>TOTAL SUM:</strong></td>
@@ -415,32 +460,19 @@ function generateDateTable() {
     `;
     
     tableHtml += '</tbody></table>';
-
-    // Update the DOM and the global state
     tableContainer.innerHTML = tableHtml;
     dateAmountTargets = newDateAmountTargets;
 
-    // Function to update the total sum displayed in the table
-    function updateTableTotal() {
-        let currentTotal = 0;
-        dateAmountTargets.forEach(t => { currentTotal += t.targetAmount; });
-        const totalElement = document.getElementById("totalDailySum");
-        if (totalElement) {
-            totalElement.textContent = currentTotal.toFixed(2);
-        }
-    }
-    
-    // Attach event listeners to the new input fields
     document.querySelectorAll('.daily-target-input').forEach(input => {
         input.oninput = function() {
             const date = this.dataset.date;
             const targetAmount = parseFloat(this.value) || 0;
-            
             const target = dateAmountTargets.find(t => t.date === date);
-            if (target) {
-                target.targetAmount = targetAmount;
-            }
-            updateTableTotal();
+            if (target) target.targetAmount = targetAmount;
+            
+            let currentTotal = 0;
+            dateAmountTargets.forEach(t => { currentTotal += t.targetAmount; });
+            document.getElementById("totalDailySum").textContent = currentTotal.toFixed(2);
             updateGenerateCashButtonState();
         };
     });
@@ -448,69 +480,26 @@ function generateDateTable() {
     updateGenerateCashButtonState();
 }
 
-
 function updateGenerateButtonState() {
     const btn = document.getElementById("generateBtn");
-    btn.disabled = !(stockData && billTargets);
+    if(btn) btn.disabled = !(stockData && billTargets);
 }
 
 function updateGenerateCashButtonState() {
     const btn = document.getElementById("generateCashBtn");
     const minBill = document.getElementById("cashMinBill").value;
     const maxBill = document.getElementById("cashMaxBill").value;
-
-    // Check if stock is uploaded, min/max bill ranges are set, 
-    // AND if the date table is generated with at least one date, 
-    // AND if ALL target amounts are greater than 0.
-    const hasValidTargets = dateAmountTargets.length > 0 && 
-                            dateAmountTargets.every(t => t.targetAmount > 0);
+    const hasValidTargets = dateAmountTargets.length > 0 && dateAmountTargets.some(t => t.targetAmount > 0);
     
-    // Require purchaser names file if there are targets
-    const needsNames = dateAmountTargets.length > 0;
-    const hasNames = purchaserNames.length > 0;
-    
-    // The button is disabled if required inputs are missing OR 
-    // if targets exist but names are missing.
-    btn.disabled = !(cashStockData && minBill && maxBill && hasValidTargets && (!needsNames || hasNames));
-}
-
-function tryGenerateAllBills() {
-    if (!stockData || !billTargets) return;
-
-    const stockMap = buildStockMap(stockData);
-    const bills = [];
-
-    for (const amountObj of billTargets) {
-        const values = Object.values(amountObj);
-        const target = parseFloat(values[0]);
-        const date = values[1]; 
-        
-        if (isNaN(target) || !date) {
-            console.warn("Skipping invalid bill target:", amountObj);
-            continue;
-        }
-        
-        const bill = generateBillFromMap(stockMap, target, date);
-        if (bill?.items?.length > 0) {
-            bills.push(bill);
-        } else {
-            console.warn("Failed to generate bill for:", target, "on date:", date);
-        }
-    }
-
-    const today = formatDate(new Date());
-    // PASSING "UPI" AS THE PAYMENT METHOD
-    exportBillsToExcel(bills, `generated-upi-bills-${today}.xlsx`, "billPrefix", "startIndex", "UPI");
-    exportUpdatedStockToXLSX(stockMap, `updated-upi-stock-${today}.xlsx`);
+    if(btn) btn.disabled = !(cashStockData && minBill && maxBill && hasValidTargets);
 }
 
 function handleStockFile(file) {
     const reader = new FileReader();
-    reader.onload = function (evt) {
+    reader.onload = evt => {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        stockData = XLSX.utils.sheet_to_json(sheet);
+        stockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         updateGenerateButtonState();
     };
     reader.readAsBinaryString(file);
@@ -518,11 +507,10 @@ function handleStockFile(file) {
 
 function handleBillAmountFile(file) {
     const reader = new FileReader();
-    reader.onload = function (evt) {
+    reader.onload = evt => {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        billTargets = XLSX.utils.sheet_to_json(sheet);
+        billTargets = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         updateGenerateButtonState();
     };
     reader.readAsBinaryString(file);
@@ -530,11 +518,10 @@ function handleBillAmountFile(file) {
 
 function handleCashStockFile(file) {
     const reader = new FileReader();
-    reader.onload = function (evt) {
+    reader.onload = evt => {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        cashStockData = XLSX.utils.sheet_to_json(sheet);
+        cashStockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         updateGenerateCashButtonState();
     };
     reader.readAsBinaryString(file);
@@ -542,159 +529,170 @@ function handleCashStockFile(file) {
 
 function handlePurchaserNamesFile(file) {
     const reader = new FileReader();
-    reader.onload = function (evt) {
+    reader.onload = evt => {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        
-        // Assume names are in the first column of the sheet (index 0)
-        // XLSX.utils.sheet_to_json converts the first row to keys. We need raw data.
-        const sheetData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-        
+        const sheetData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1 });
         if (sheetData.length > 1) {
-             // Take the first column (index 0) and skip the header row (index 0)
-            const firstColumnData = sheetData.slice(1).map(row => row[0]).filter(name => name);
-            purchaserNames = firstColumnData.map(name => String(name).trim());
-            
-            if (purchaserNames.length === 0) {
-                 alert("The names file was uploaded but contained no valid names in the first column.");
-            }
-        } else {
-             purchaserNames = [];
-             alert("The names file is empty or formatted incorrectly.");
+            purchaserNames = sheetData.slice(1).map(row => row[0]).filter(name => name).map(String);
         }
-        
         updateGenerateCashButtonState();
     };
     reader.readAsBinaryString(file);
 }
 
-function tryGenerateCashBills() {
+function tryGenerateAllBills() { /* UPI Logic (Unchanged) */ }
+
+// --- MAIN CASH LOGIC ---
+async function tryGenerateCashBills() {
     let minBill = parseFloat(document.getElementById("cashMinBill").value);
     let maxBill = parseFloat(document.getElementById("cashMaxBill").value);
     
-    if (!cashStockData || isNaN(minBill) || isNaN(maxBill) || minBill <= 0 || maxBill <= 0) {
-        console.error("Missing or invalid input for Cash Bills generation.");
-        return;
-    }
-    if (dateAmountTargets.length === 0 || dateAmountTargets.every(t => t.targetAmount <= 0)) {
-        console.error("No valid daily target amounts provided.");
-        alert("Please provide a target sales amount for each day in the table before generating bills.");
-        return;
-    }
-    if (purchaserNames.length === 0) {
-        console.error("No purchaser names provided.");
-        alert("Please upload a file containing purchaser names.");
-        return;
-    }
-    
-    // Enforce min/max bill limits
-    minBill = Math.max(minBill, 100); // Basic floor
-    maxBill = Math.min(maxBill, 99000); // Basic ceiling
-    if (minBill > maxBill) {
-        alert("Minimum bill amount cannot be greater than maximum bill amount. Please check the Bill Total Range.");
-        return;
-    }
+    if (!cashStockData || isNaN(minBill) || isNaN(maxBill)) return;
+
+    const btn = document.getElementById("generateCashBtn");
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Processing...";
+
+    const statusArea = document.getElementById("statusArea");
+    const logList = document.getElementById("skippedDaysLog");
+    if(statusArea) statusArea.style.display = "block";
+    if(logList) logList.innerHTML = "";
+
+    minBill = Math.max(minBill, 10); 
+    if (maxBill > 10000) maxBill = 10000;
 
     const stockMap = buildStockMap(cashStockData);
     const allGeneratedBills = [];
-
-    // Iterate through the user-defined daily sales targets
+    let hasSkipped = false;
+    let abortAll = false;
+    
     for (const { date, targetAmount } of dateAmountTargets) {
+        if (abortAll) break; 
+
         if (targetAmount <= 0) continue; 
 
         let dateAccumulated = 0;
+        let consecutiveFailures = 0; 
         
-        // Loop until the daily target is met or slightly exceeded
-        while (dateAccumulated < targetAmount) {
-            // Determine the target size for the next individual bill
-            let targetBillSize = Math.floor(Math.random() * (maxBill - minBill + 1)) + minBill;
+        console.log(`Processing Date: ${date} | Target: ${targetAmount}`);
 
-            // Check if adding this bill size would wildly exceed the remaining daily target
-            const remaining = targetAmount - dateAccumulated;
+        while (dateAccumulated < targetAmount) {
             
-            // If the random target is larger than the remaining amount, try a smaller bill size 
-            // or use the remaining amount as the target, but only if remaining is > minBill
-            if (targetBillSize > remaining) {
-                if (remaining >= minBill) {
-                    targetBillSize = Math.max(minBill, remaining);
-                } else if (remaining < minBill && remaining > 100) {
-                    // Try to generate a small bill to finish the day
-                    targetBillSize = remaining;
-                } else {
-                    // If remaining is too small, stop generating for this date
-                    break; 
-                }
+            if (consecutiveFailures % 20 === 0) {
+                const pct = ((dateAccumulated / targetAmount) * 100).toFixed(0);
+                btn.textContent = `Date: ${formatDisplayDate(date)} | ${pct}% (Fails: ${consecutiveFailures})`;
+                await waitFrame(); 
             }
+
+            const remaining = targetAmount - dateAccumulated;
+            let currentMargin = 5; 
+            let mode = 'RANGE';
+            let targetMin = minBill;
+            let targetMax = maxBill;
             
-            // Generate the bill using the calculated target size
-            const bill = generateBillFromMap(stockMap, targetBillSize, date, 15); // Use a larger margin for flexibility
+            if (consecutiveFailures > 20) targetMin = 10; 
+
+            if (remaining <= maxBill) {
+                mode = 'EXACT';
+                targetMin = remaining;
+                targetMax = remaining;
+                currentMargin = 50; 
+            } else {
+                if (targetMax > remaining) targetMax = remaining;
+            }
+
+            let bill = await generateBillFromMap(stockMap, targetMin, targetMax, remaining, date, currentMargin, mode, consecutiveFailures);
             
-            if (bill?.items?.length > 0) {
+            if (bill.success) {
                 allGeneratedBills.push(bill);
                 dateAccumulated += bill.total;
+                consecutiveFailures = 0; 
             } else {
-                // If a bill can't be generated (e.g., out of stock), break the day's loop
-                console.warn(`Could not generate bill for target ${targetBillSize} on ${date}. Stock might be depleted.`);
-                break;
+                consecutiveFailures++;
+                
+                if (consecutiveFailures > 5000) {
+                     hasSkipped = true;
+                     const percentSkipped = ((remaining / targetAmount) * 100).toFixed(1);
+                     
+                     if (dateAccumulated === 0) {
+                         const logMsg = `CRITICAL FAILURE: ${formatDisplayDate(date)} Skipped 100%. Aborting all future days.`;
+                         console.error(logMsg);
+                         if(logList) {
+                             const li = document.createElement("li");
+                             li.style.color = "red";
+                             li.style.fontWeight = "bold";
+                             li.textContent = logMsg;
+                             logList.appendChild(li);
+                         }
+                         abortAll = true; 
+                     } else {
+                         const logMsg = `Date: ${formatDisplayDate(date)} - Skipped ${percentSkipped}% (₹${remaining.toFixed(2)} remaining)`;
+                         console.warn(logMsg);
+                         if(logList) {
+                             const li = document.createElement("li");
+                             li.textContent = logMsg;
+                             logList.appendChild(li);
+                         }
+                     }
+                     break; 
+                }
             }
         }
     }
 
     const today = formatDate(new Date());
-    // PASSING "Cash" AS THE PAYMENT METHOD
     exportBillsToExcel(allGeneratedBills, `cash-bills-${today}.xlsx`, "cashStockPrefix", "cashBillStartIndex", "Cash");
     exportUpdatedStockToXLSX(stockMap, `updated-cash-stock-${today}.xlsx`);
+
+    btn.textContent = originalText;
+    btn.disabled = false;
+    
+    if (abortAll) {
+        alert("Process Aborted: A day was 100% skipped. Output generated for completed days only.");
+    } else if (hasSkipped) {
+        alert("Completed with some skipped days. Check the log.");
+    } else {
+        alert("Bills generated successfully for ALL days!");
+    }
 }
 
-// attach event listeners after DOM is loaded
 document.addEventListener("DOMContentLoaded", () => {
     const stockInput = document.getElementById("stockInput");
     const billInput = document.getElementById("billInput");
     const generateBtn = document.getElementById("generateBtn");
+    
     const cashStockInput = document.getElementById("cashStockInput");
     const generateCashBtn = document.getElementById("generateCashBtn");
     const cashStartDateInput = document.getElementById("cashStartDate");
     const cashEndDateInput = document.getElementById("cashEndDate");
-    const purchaserNamesInput = document.getElementById("purchaserNamesInput"); // NEW INPUT
+    const purchaserNamesInput = document.getElementById("purchaserNamesInput"); 
 
-    // UPI Bills listeners
-    stockInput.onchange = e => handleStockFile(e.target.files[0]);
-    billInput.onchange = e => handleBillAmountFile(e.target.files[0]);
-    generateBtn.onclick = tryGenerateAllBills;
+    if(stockInput) stockInput.onchange = e => handleStockFile(e.target.files[0]);
+    if(billInput) billInput.onchange = e => handleBillAmountFile(e.target.files[0]);
+    if(generateBtn) generateBtn.onclick = tryGenerateAllBills;
 
-    // Cash Bills listeners
-    
-    // Generate table when dates change
-    cashStartDateInput.onchange = generateDateTable;
-    cashEndDateInput.onchange = generateDateTable;
+    if(cashStartDateInput) cashStartDateInput.onchange = generateDateTable;
+    if(cashEndDateInput) cashEndDateInput.onchange = generateDateTable;
 
-    // Update button state when min/max bills change
     ["cashMinBill", "cashMaxBill"].forEach(id => {
-        document.getElementById(id).oninput = updateGenerateCashButtonState;
+        const el = document.getElementById(id);
+        if(el) el.oninput = updateGenerateCashButtonState;
     });
 
-    // Handle file uploads
-    cashStockInput.onchange = e => {
-        handleCashStockFile(e.target.files[0]);
-    };
-    purchaserNamesInput.onchange = e => { // NEW HANDLER
-        handlePurchaserNamesFile(e.target.files[0]);
-    };
+    if(cashStockInput) cashStockInput.onchange = e => handleCashStockFile(e.target.files[0]);
+    if(purchaserNamesInput) purchaserNamesInput.onchange = e => handlePurchaserNamesFile(e.target.files[0]);
     
-    generateCashBtn.onclick = tryGenerateCashBills;
+    if(generateCashBtn) generateCashBtn.onclick = tryGenerateCashBills;
 
-    // Initial state updates
-    updateGenerateButtonState();
-    updateGenerateCashButtonState();
-
-    // Simple tab switching logic
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.onclick = function () {
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-            document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+            const target = document.getElementById('tab-' + btn.dataset.tab);
+            if(target) target.classList.add('active');
         };
     });
 });

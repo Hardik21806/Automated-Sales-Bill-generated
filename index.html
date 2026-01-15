@@ -1,97 +1,100 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bill Generator</title>
-    <!-- SheetJS for Excel handling -->
-    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
-    <link rel="stylesheet" href="./style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bill Generator Ultimate</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
-
 <body>
-    <div class="container">
-        <div class="tab-bar">
-            <button class="tab-btn active" data-tab="upi">UPI Bills</button>
-            <button class="tab-btn" data-tab="cash">Cash Bills</button>
-        </div>
-        <div id="tab-upi" class="tab-content active">
-            <h1>Automated Sales Bill Generator (UPI Bills)</h1>
-            <p>Upload your stock and bill amount files to generate sales bills.</p>
-            <label>
-                Bill Number Prefix:
-                <input type="text" id="billPrefix" placeholder="e.g. BILL" value="BILL">
-            </label>
-            <br><br>
-            <label>
-                Start Index:
-                <input type="number" id="startIndex" placeholder="e.g. 1" value="1">
-            </label>
-            <br><br>
-            <label>
-                Upload Stock File:
-                <input type="file" id="stockInput" accept=".xlsx, .xls">
-            </label>
-            <br><br>
-            <label>
-                Upload Bill Amount File:
-                <input type="file" id="billInput" accept=".xlsx, .xls">
-            </label>
-            <br><br>
-            <button id="generateBtn" disabled>Generate Bills</button>
-        </div>
-        
-        <div id="tab-cash" class="tab-content">
-            <h1>Cash Bills (Date Planner)</h1>
-            <p>Define stock, date range, and daily target sales amount to generate bills.</p>
-            
-            <label>
-                Bill Number Prefix:
-                <input type="text" id="cashStockPrefix" placeholder="e.g. BILL" value="BILL">
-            </label>
-            <br><br>
-            <label>
-                Start Index:
-                <input type="number" id="cashBillStartIndex" placeholder="e.g. 1" value="1">
-            </label>
-            <br><br>
-            <div class="date-range-inputs">
-                <label>
-                    Date Range:
-                    <input type="date" id="cashStartDate"> to <input type="date" id="cashEndDate">
-                </label>
-            </div>
-            
-            <div id="dateAmountTableContainer" class="table-container">
-                <!-- Date/Amount table will be generated here -->
-            </div>
-            <br>
-            
-            <label>
-                Bill Total Range (for individual bills):
-                <input type="number" id="cashMinBill" placeholder="Min Bill Total"> to <input type="number" id="cashMaxBill"
-                    placeholder="Max Bill Total">
-            </label>
-            <br><br>
-            
-            <label>
-                Upload Stock File:
-                <input type="file" id="cashStockInput" accept=".xlsx, .xls">
-            </label>
-            <br><br>
-            
-            <!-- NEW PURCHASER NAME INPUT -->
-            <label>
-                Upload Purchaser Names File:
-                <input type="file" id="purchaserNamesInput" accept=".xlsx, .xls">
-            </label>
-            <br><br>
-            <!---------------------------->
 
-            <button id="generateCashBtn" disabled>Generate Cash Bills</button>
+<div class="container">
+    <h1>Bill Generator Ultimate</h1>
+
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="upi">UPI / Bank Bills</button>
+        <button class="tab-btn" data-tab="cash">Cash Bills (Daily)</button>
+    </div>
+
+    <div id="tab-upi" class="tab-content active">
+        <div class="card">
+            <h2>1. Upload Data</h2>
+            <div class="form-group">
+                <label>Stock File (XLSX):</label>
+                <input type="file" id="stockInput" accept=".xlsx, .xls">
+            </div>
+            <div class="form-group">
+                <label>Bill Amounts (XLSX):</label>
+                <input type="file" id="billInput" accept=".xlsx, .xls">
+            </div>
+        </div>
+        <div class="card">
+            <button id="generateBtn" disabled>Generate UPI Bills</button>
         </div>
     </div>
-    <script src="./index.js"></script>
-</body>
 
+    <div id="tab-cash" class="tab-content">
+        <div class="card">
+            <h2>1. Upload Cash Data</h2>
+            <div class="form-group">
+                <label>Stock File (XLSX):</label>
+                <input type="file" id="cashStockInput" accept=".xlsx, .xls">
+            </div>
+            <div class="form-group">
+                <label>Purchaser Names (XLSX):</label>
+                <input type="file" id="purchaserNamesInput" accept=".xlsx, .xls">
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>2. Date & Target Settings</h2>
+            <div class="row">
+                <div class="col">
+                    <label>Start Date:</label>
+                    <input type="date" id="cashStartDate">
+                </div>
+                <div class="col">
+                    <label>End Date:</label>
+                    <input type="date" id="cashEndDate">
+                </div>
+            </div>
+            <div id="dateAmountTableContainer"></div>
+        </div>
+
+        <div class="card">
+            <h2>3. Bill Configuration</h2>
+            <div class="row">
+                <div class="col">
+                    <label>Min Bill Amount (₹):</label>
+                    <input type="number" id="cashMinBill" value="5000">
+                </div>
+                <div class="col">
+                    <label>Max Bill Amount (₹):</label>
+                    <input type="number" id="cashMaxBill" value="10000">
+                </div>
+            </div>
+            <div class="row">
+                <div class="col">
+                    <label>Bill Prefix:</label>
+                    <input type="text" id="cashStockPrefix" value="BILL">
+                </div>
+                <div class="col">
+                    <label>Start Index:</label>
+                    <input type="number" id="cashBillStartIndex" value="1">
+                </div>
+            </div>
+            
+            <button id="generateCashBtn" disabled>Generate Cash Bills</button>
+            
+            <div id="statusArea" class="status-box" style="margin-top: 15px; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; display:none;">
+                <h3 style="margin-top:0;">Skipped Days Report:</h3>
+                <ul id="skippedDaysLog" style="color: #d9534f; font-weight: bold;"></ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="index.js"></script>
+</body>
 </html>
