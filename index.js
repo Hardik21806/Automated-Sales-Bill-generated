@@ -588,7 +588,7 @@ async function tryGenerateCashBills() {
                 consecutiveFailures++;
                 
                 // CRITICAL SKIP LOGIC
-                if (consecutiveFailures > 5000) {
+                if (consecutiveFailures > 500) {
                      hasSkipped = true;
                      const percentSkipped = ((remaining / targetAmount) * 100).toFixed(1);
                      
