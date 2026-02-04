@@ -2,7 +2,6 @@
 // 1. UTILITY FUNCTIONS
 // ==========================================
 
-// Shuffle Array (Fisher-Yates)
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -10,7 +9,6 @@ function shuffleArray(array) {
     }
 }
 
-// Calculate total price with taxes
 function calculateItemTotal(price, qty, gstPercent, cessPercent, mrp) {
     const base = price * qty;
     const gstTax = (base * gstPercent) / 100;
@@ -18,7 +16,6 @@ function calculateItemTotal(price, qty, gstPercent, cessPercent, mrp) {
     return +(base + gstTax + cessTax).toFixed(2);
 }
 
-// Helper: Calculate Total Stock Value for UI Display
 function calculateTotalStockValue(data, displayElementId) {
     let totalValue = 0;
     data.forEach(item => {
@@ -32,22 +29,23 @@ function calculateTotalStockValue(data, displayElementId) {
     }
 }
 
-// Async Helper to prevent browser freezing
 function waitFrame() {
     return new Promise(resolve => setTimeout(resolve, 0));
 }
 
-// Build the Stock Map for O(1) access
 function buildStockMap(data) {
     const map = new Map();
     for (const item of data) {
         const key = item["Item Details"];
         const qty = Number(item["Qty."]) || 0;
         
+        // CHECK: Is the input quantity a fraction? (e.g., 1.5)
+        const isInputFloat = Math.abs(qty % 1) > 0.0001;
+
         map.set(key, {
             ...item,
             remainingQty: qty,
-            // Pre-calculate single unit cost for faster feasibility checks
+            originalIsFloat: isInputFloat, // Store this for later checks
             singleUnitCost: calculateItemTotal(Number(item["Price"]), 1, Number(item["GST PERCENT"]), Number(item["CESS%"]), Number(item["MRP"])),
             "Price": Number(item["Price"]) || 0,
             "GST PERCENT": Number(item["GST PERCENT"]) || 0,
@@ -58,7 +56,6 @@ function buildStockMap(data) {
     return map;
 }
 
-// Wrapper for bill item calculation
 function getItemBillTotal(item, qty) {
     return calculateItemTotal(
         item["Price"],
@@ -69,17 +66,15 @@ function getItemBillTotal(item, qty) {
     );
 }
 
-// Check if an item is allowed to be sold in decimals
-function canSellInFloat(item, roomLeft) {
-    // 1. Expensive Item Rule (MRP > 10000)
+// STRICT FLOAT LOGIC: ONLY if Input was Float OR MRP > 10000
+function canSellInFloat(item) {
+    // 1. MRP Rule: Expensive items can always float
     if (item["MRP"] > 10000) return true;
     
-    // 2. Stock is already a decimal (broken quantity)
-    if (item.remainingQty % 1 !== 0) return true;
+    // 2. Input Rule: If it came as a fraction, it can be sold as a fraction
+    if (item.originalIsFloat) return true;
     
-    // 3. Budget Fit Rule: If 1 whole unit is too expensive for the current bill gap, allow float
-    if (item.singleUnitCost > roomLeft) return true;
-
+    // Otherwise, Strictly Integer (Whole Numbers)
     return false;
 }
 
@@ -87,37 +82,39 @@ function canSellInFloat(item, roomLeft) {
 // 2. CORE GENERATOR LOGIC
 // ==========================================
 
+// Global Counter
+let billCounter = 0;
+
 async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemaining, date, margin = 5, mode = 'RANGE', currentFailures = 0) {
+    billCounter++;
     
-    // 1. Prepare Available Stock
-    // We allow even small decimal stock (e.g. 0.05) to be used
     let availableItems = Array.from(stockMap.values())
         .filter(item => item.remainingQty > 0.001); 
         
-    // Sort Low -> High for feasibility checks
+    // Sort Low -> High for logic
     availableItems.sort((a, b) => a.singleUnitCost - b.singleUnitCost);
 
     const itemCount = availableItems.length;
     if (itemCount === 0) return { items: [], total: 0, success: false, reason: "No items" };
 
-    const absoluteCheapestCost = availableItems[0].singleUnitCost;
+    // Create Pools for "Randomized Big First" Strategy
+    // Top 50% Expensive Items
+    const splitIndex = Math.floor(availableItems.length / 2);
+    const cheapItems = availableItems.slice(0, splitIndex);
+    const expensiveItems = availableItems.slice(splitIndex);
 
-    // Create a "High Value First" list for Priority Strategy
-    const expensiveItemsFirst = [...availableItems].sort((a, b) => b.singleUnitCost - a.singleUnitCost);
-
-    // --- DYNAMIC EFFORT SCALING ---
-    // If we are failing, reduce the attempts per tier to fail faster and move to next logic
+    // Dynamic Effort
     let effortMultiplier = 1.0;
     if (currentFailures > 50) effortMultiplier = 0.5;   
-    if (currentFailures > 500) effortMultiplier = 0.1; 
-    if (currentFailures > 2000) effortMultiplier = 0.02; 
+    if (currentFailures > 200) effortMultiplier = 0.1; 
+    if (currentFailures > 400) effortMultiplier = 0.02; 
 
-    // Tiered Configuration
+    // INCREASED ATTEMPTS FOR MORE RANDOMNESS
     const baseAttempts = [
-        { count: 4, attempts: 50 },
-        { count: 3, attempts: 50 },
-        { count: 2, attempts: 100 }, 
-        { count: 1, attempts: 20 }
+        { count: 4, attempts: 200 }, // Increased from 50
+        { count: 3, attempts: 200 }, // Increased from 50
+        { count: 2, attempts: 200 }, 
+        { count: 1, attempts: 50 }
     ];
 
     for (const tier of baseAttempts) {
@@ -126,33 +123,35 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
 
         if (itemCount < minItems) continue;
 
-        // Feasibility Check (can we even afford the cheapest items?)
-        // Note: With float logic, this is less strict, but good for sanity check
         let minPossibleCost = 0;
         for(let i=0; i<minItems; i++) minPossibleCost += availableItems[i].singleUnitCost;
 
-        // If the absolute cheapest WHOLE units break the budget, and we can't float them (rare), skip.
-        // Actually, let's trust the inner loop to handle floats.
         if (minPossibleCost > targetMax && minPossibleCost > dayTotalRemaining) {
-             // Only skip if we also can't float ANY of them? 
-             // Let's perform a loose check.
+             // Check continued in loop
         }
 
-        // --- ATTEMPT LOOP ---
         let selectionPool = [];
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            
-            // Yield to browser occasionally
             if (attempt % 50 === 0) await waitFrame();
 
-            // STRATEGY: 
-            // Attempt 0 = Big Items First (Clear expensive stock)
-            // Attempt >0 = Random (Find any combination)
-            if (attempt === 0) {
-                selectionPool = expensiveItemsFirst;
+            // --- IMPROVED RANDOM STRATEGY ---
+            // Early Attempts (0-20%): Prioritize Expensive, but SHUFFLE them so it's not always the same one.
+            // Late Attempts (>20%): Pure Random to find any fit.
+            
+            if (attempt < (maxAttempts * 0.2)) {
+                // "Randomized Big First"
+                // Shuffle the expensive pool, Shuffle the cheap pool, then combine.
+                // This ensures we look at expensive items first, but in a random order.
+                const shuffledExpensive = [...expensiveItems];
+                shuffleArray(shuffledExpensive);
+                const shuffledCheap = [...cheapItems];
+                shuffleArray(shuffledCheap);
+                
+                selectionPool = [...shuffledExpensive, ...shuffledCheap];
             } else {
-                selectionPool = [...availableItems]; // Copy
+                // "Pure Random"
+                selectionPool = [...availableItems]; 
                 shuffleArray(selectionPool);
             }
 
@@ -166,62 +165,58 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
                 return Math.max(0, i.remainingQty - used);
             };
 
-            // ITEM PICKER
             for (const item of selectionPool) {
-                // Done condition
+                // Probabilistic break to increase variety in bill size/composition
                 if (currentTotal >= targetMin && pickedCount >= minItems) {
-                     if (attempt === 0 || Math.random() > 0.5) break; 
+                     if (Math.random() > 0.5) break; 
                 }
                 
                 const actualRemaining = getRem(item);
                 if (actualRemaining <= 0.001) continue;
 
                 const roomLeft = targetMax - currentTotal;
-                if (roomLeft < 1) continue; // Tiny gap
+                if (roomLeft < 1) continue;
 
-                // --- FLOAT LOGIC INTEGRATION ---
-                const allowFloat = canSellInFloat(item, roomLeft);
+                // --- STRICT FLOAT CHECK ---
+                const allowFloat = canSellInFloat(item);
                 
+                // If we CANNOT float, and the whole item is too expensive, SKIP IT completely.
+                if (!allowFloat && item.singleUnitCost > roomLeft) continue;
+
                 let maxQtyBudget = roomLeft / item.singleUnitCost;
                 let absMax = Math.min(actualRemaining, maxQtyBudget);
-
                 let qty = 0;
 
                 if (allowFloat) {
-                    // Decimal Pick
+                    // Logic for Allowed Floats
                     if (absMax < 0.01) continue;
-                    
-                    // In "Big First" mode, try to take as much as possible to clear it
-                    // In Random mode, take a random chunk
-                    let factor = (attempt === 0) ? 0.9 : (Math.random() * 0.8 + 0.2);
+                    // Random factor to create variety (not always taking max)
+                    let factor = Math.random() * 0.8 + 0.2; 
                     qty = parseFloat((absMax * factor).toFixed(2));
                     
-                    // Cap quantity if we need to save room for more items
                     if (pickedCount < minItems && qty > absMax / 2) {
                          qty = parseFloat((absMax / 2).toFixed(2));
                     }
                 } else {
-                    // Integer Pick
+                    // Logic for Strict Integers
                     let intMax = Math.floor(absMax);
-                    if (intMax < 1) continue;
+                    if (intMax < 1) continue; 
                     
                     if (pickedCount < minItems) intMax = Math.min(intMax, 2);
+                    // Random integer quantity
                     qty = Math.floor(Math.random() * intMax) + 1;
                 }
 
                 if (qty <= 0) continue;
 
                 let cost = getItemBillTotal(item, qty);
-                
                 currentBill.push({ item, qty, cost });
                 currentTotal += cost;
                 pickedCount++;
                 tempUsed.set(item["Item Details"], (tempUsed.get(item["Item Details"]) || 0) + qty);
             }
 
-            // --- VALIDATION & SAFE LANDING ---
             let isValid = false;
-            // Exact mode tolerance
             const tolerance = mode === 'EXACT' ? margin : 0;
 
             if (mode === 'RANGE') {
@@ -233,33 +228,18 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
             if (isValid) {
                 const futureDayRemaining = dayTotalRemaining - currentTotal;
                 
-                // Safe Landing: 
-                // We are safe if:
-                // 1. We finished the day (remainder <= margin)
-                // 2. We have enough money left to buy SOMETHING later (>= cheapest item cost)
-                // Note: With float logic, we can buy fractions, so even a small remainder is usually usable.
-                // We check > 50 to avoid being left with ₹12 that no item can fulfill nicely.
-                
+                // Safe Landing
                 if (futureDayRemaining <= margin || futureDayRemaining > 50) { 
-                    // SUCCESS! Commit stock changes.
-                    currentBill.forEach(entry => {
-                        const realItem = stockMap.get(entry.item["Item Details"]);
-                        // Precision handling for float subtraction
-                        realItem.remainingQty = parseFloat((realItem.remainingQty - entry.qty).toFixed(3));
-                    });
-                    return formatResult(currentBill, currentTotal, targetMax, date);
+                    const billData = formatResult(currentBill, currentTotal, targetMax, date);
+                    billData.tempUsedMap = tempUsed;
+                    return billData;
                 }
             }
-            
-            // If failed, loop continues to next shuffle
         }
     }
-    
-    // All tiers failed
     return { items: [], total: 0, success: false };
 }
 
-// Format the bill object for Excel
 function formatResult(billArray, total, target, date) {
     const finalItems = billArray.map(entry => {
         const cessTaxAmount = ((entry.item["MRP"] || 0) * entry.qty * (entry.item["CESS%"] || 0)) / 100;
@@ -296,8 +276,11 @@ function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
     const totalNames = namesToAssign.length;
     
     bills.forEach((bill, index) => {
-        const billPurchaserName = namesToAssign[purchaserIndexCounter % totalNames];
-        purchaserIndexCounter++;
+        let billPurchaserName = bill.purchaserName;
+        if (!billPurchaserName) {
+             billPurchaserName = namesToAssign[purchaserIndexCounter % totalNames];
+             purchaserIndexCounter++;
+        }
         
         let roundOff = 0;
         let finalBillTotal = bill.total;
@@ -311,6 +294,14 @@ function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
         bill.items.forEach(item => {
             const billNo = generateBillNumber(index + startIndex, prefix);
             const taxAmount = item.itemTotal - (item.unitPrice * item.qty) - (item.cessTaxAmount || 0);
+            
+            // Calculate CGST and SGST
+            const gstRate = item.gstPercent || 0;
+            const cgstRate = gstRate / 2;
+            const sgstRate = gstRate / 2;
+            const cgstAmount = taxAmount / 2;
+            const sgstAmount = taxAmount / 2;
+
             rows.push({
                 "Bill No": billNo,
                 "Purchaser Name": billPurchaserName, 
@@ -319,7 +310,11 @@ function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
                 "Quantity": item.qty,
                 "Unit Price": item.unitPrice,
                 "Item Price": +(item.unitPrice * item.qty).toFixed(2),
-                "GST %": item.gstPercent,
+                "GST %": gstRate,
+                "CGST %": cgstRate,
+                "CGST Amount": +(cgstAmount).toFixed(2),
+                "SGST %": sgstRate,
+                "SGST Amount": +(sgstAmount).toFixed(2),
                 "Total Tax Amount": +(taxAmount).toFixed(2),
                 "CESS Tax Amount": +(item.cessTaxAmount || 0).toFixed(2),
                 "Date": formatDisplayDate(item.date),
@@ -472,7 +467,7 @@ function handleStockFile(file) {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
         stockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
-        calculateTotalStockValue(stockData, "upiStockTotal"); // DISPLAY TOTAL
+        calculateTotalStockValue(stockData, "upiStockTotal"); 
         updateGenerateButtonState();
     };
     reader.readAsBinaryString(file);
@@ -495,7 +490,7 @@ function handleCashStockFile(file) {
         const data = evt.target.result;
         const workbook = XLSX.read(data, { type: 'binary' });
         cashStockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
-        calculateTotalStockValue(cashStockData, "cashStockTotal"); // DISPLAY TOTAL
+        calculateTotalStockValue(cashStockData, "cashStockTotal");
         updateGenerateCashButtonState();
     };
     reader.readAsBinaryString(file);
@@ -515,7 +510,7 @@ function handlePurchaserNamesFile(file) {
     reader.readAsBinaryString(file);
 }
 
-function tryGenerateAllBills() { /* UPI Logic is separate, standard */ }
+function tryGenerateAllBills() { /* UPI Logic Standard */ }
 
 // --- MAIN CASH LOGIC ---
 async function tryGenerateCashBills() {
@@ -540,32 +535,45 @@ async function tryGenerateCashBills() {
     const stockMap = buildStockMap(cashStockData);
     const allGeneratedBills = [];
     let hasSkipped = false;
-    let abortAll = false;
     
-    for (const { date, targetAmount } of dateAmountTargets) {
-        if (abortAll) break; // Previous day failed 100%
+    let purchaserHistory = {}; 
+    const availablePurchasers = purchaserNames.length > 0 ? [...purchaserNames] : ['N/A'];
 
+    for (const { date, targetAmount } of dateAmountTargets) {
+        
         if (targetAmount <= 0) continue; 
 
         let dateAccumulated = 0;
         let consecutiveFailures = 0; 
         
+        let todaysBills = [];
+
         console.log(`Processing Date: ${date} | Target: ${targetAmount}`);
 
         while (dateAccumulated < targetAmount) {
             
-            // UI Update: Percentage
+            const remaining = targetAmount - dateAccumulated;
+
+            if (remaining <= 5) {
+                break; 
+            }
+
             if (consecutiveFailures % 20 === 0) {
                 const pct = ((dateAccumulated / targetAmount) * 100).toFixed(0);
                 btn.textContent = `Date: ${formatDisplayDate(date)} | ${pct}% (Fails: ${consecutiveFailures})`;
                 await waitFrame(); 
             }
 
-            const remaining = targetAmount - dateAccumulated;
+            // RANDOM TARGET LOGIC
             let currentMargin = 5; 
             let mode = 'RANGE';
-            let targetMin = minBill;
-            let targetMax = maxBill;
+            
+            let randomTarget = minBill + Math.random() * (maxBill - minBill);
+            let randomMin = Math.max(minBill, randomTarget * 0.95);
+            let randomMax = Math.min(maxBill, randomTarget * 1.05);
+
+            let targetMin = randomMin;
+            let targetMax = randomMax;
             
             if (consecutiveFailures > 20) targetMin = 10; 
 
@@ -581,41 +589,92 @@ async function tryGenerateCashBills() {
             let bill = await generateBillFromMap(stockMap, targetMin, targetMax, remaining, date, currentMargin, mode, consecutiveFailures);
             
             if (bill.success) {
-                allGeneratedBills.push(bill);
+                // --- UNIQUENESS CHECK (Previous 3 Bills) ---
+                const recentBills = allGeneratedBills.slice(-3).concat(todaysBills.slice(-3));
+                const last3Totals = recentBills.slice(-3).map(b => b.total);
+
+                if (last3Totals.includes(bill.total) && consecutiveFailures < 50 && mode !== 'EXACT') {
+                    consecutiveFailures++;
+                    continue; 
+                }
+
+                if (bill.tempUsedMap) {
+                    for (let [name, qty] of bill.tempUsedMap.entries()) {
+                        const item = stockMap.get(name);
+                        item.remainingQty = parseFloat((item.remainingQty - qty).toFixed(3));
+                    }
+                }
+
+                todaysBills.push(bill);
                 dateAccumulated += bill.total;
                 consecutiveFailures = 0; 
             } else {
                 consecutiveFailures++;
                 
-                // CRITICAL SKIP LOGIC
                 if (consecutiveFailures > 500) {
                      hasSkipped = true;
                      const percentSkipped = ((remaining / targetAmount) * 100).toFixed(1);
                      
-                     // If we made NO progress on this day, stock is likely broken. Abort all.
+                     let logMsg = `Date: ${formatDisplayDate(date)} - Skipped ${percentSkipped}% (₹${remaining.toFixed(2)} remaining)`;
+                     
                      if (dateAccumulated === 0) {
-                         const logMsg = `CRITICAL ERROR: ${formatDisplayDate(date)} Skipped 100%. Stopping all future days.`;
-                         console.error(logMsg);
-                         if(logList) {
-                             const li = document.createElement("li");
+                         logMsg = `FAILURE: ${formatDisplayDate(date)} Skipped 100% (No valid bills generated). Moving to next day.`;
+                     }
+
+                     console.warn(logMsg);
+                     if(logList) {
+                         const li = document.createElement("li");
+                         li.textContent = logMsg;
+                         if (dateAccumulated === 0) {
                              li.style.color = "red";
                              li.style.fontWeight = "bold";
-                             li.textContent = logMsg;
-                             logList.appendChild(li);
                          }
-                         abortAll = true; 
-                     } else {
-                         // Partial Skip
-                         const logMsg = `Date: ${formatDisplayDate(date)} - Skipped ${percentSkipped}% (₹${remaining.toFixed(2)} remaining)`;
-                         console.warn(logMsg);
-                         if(logList) {
-                             const li = document.createElement("li");
-                             li.textContent = logMsg;
-                             logList.appendChild(li);
-                         }
+                         logList.appendChild(li);
                      }
                      break; 
                 }
+            }
+        }
+
+        // --- END OF DAY: ASSIGN PURCHASERS ---
+        if (todaysBills.length > 0) {
+            let dailyNamePool = [...availablePurchasers];
+            if (dailyNamePool.length > 1) shuffleArray(dailyNamePool);
+            
+            let nameIdx = 0;
+            
+            for (let b of todaysBills) {
+                let assignedName = "N/A";
+                
+                if (availablePurchasers.length > 0 && availablePurchasers[0] !== 'N/A') {
+                    let bestCandidate = null;
+                    let attempts = 0;
+                    
+                    while (attempts < dailyNamePool.length) {
+                        let candidate = dailyNamePool[nameIdx % dailyNamePool.length];
+                        let lastTotal = purchaserHistory[candidate] || 0;
+                        
+                        if (Math.abs(lastTotal - b.total) > 1) {
+                            bestCandidate = candidate;
+                            nameIdx++; 
+                            break;
+                        }
+                        
+                        nameIdx++;
+                        attempts++;
+                    }
+                    
+                    if (!bestCandidate) {
+                        bestCandidate = dailyNamePool[nameIdx % dailyNamePool.length];
+                        nameIdx++;
+                    }
+                    
+                    assignedName = bestCandidate;
+                    purchaserHistory[assignedName] = b.total; 
+                }
+                
+                b.purchaserName = assignedName;
+                allGeneratedBills.push(b);
             }
         }
     }
@@ -627,12 +686,10 @@ async function tryGenerateCashBills() {
     btn.textContent = originalText;
     btn.disabled = false;
     
-    if (abortAll) {
-        alert("Process Stopped: A day failed 100%. Check log for details.");
-    } else if (hasSkipped) {
-        alert("Done with some skipped days. Check log below.");
+    if (hasSkipped) {
+        alert("Completed with some skipped days. Check the log.");
     } else {
-        alert("Success! All bills generated.");
+        alert("Bills generated successfully for ALL days!");
     }
 }
 
