@@ -6,6 +6,10 @@
     <title>Bill Generator Ultimate</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        .date-amount-table th, .date-amount-table td { padding: 8px; border-bottom: 1px solid #ddd; }
+        .qty-input-box { width: 100px; padding: 4px; text-align: center; border: 1px solid #ccc; border-radius: 4px;}
+    </style>
 </head>
 <body>
 
@@ -43,6 +47,7 @@
                     <input type="number" id="startIndex" value="1">
                 </div>
             </div>
+            <p style="font-size: 12px; color: #7f8c8d;">* UPI items are strictly enforced to have a line price >= ₹200.</p>
             <button id="generateBtn" disabled>Generate UPI Bills</button>
         </div>
     </div>
@@ -73,7 +78,7 @@
                     <input type="date" id="cashEndDate">
                 </div>
             </div>
-            <div id="dateAmountTableContainer"></div>
+            <div id="dateAmountTableContainer" style="overflow-x: auto;"></div>
         </div>
 
         <div class="card">
@@ -86,6 +91,16 @@
                 <div class="col">
                     <label>Max Bill Amount (₹):</label>
                     <input type="number" id="cashMaxBill" value="10000">
+                </div>
+            </div>
+            <div class="row">
+                <div class="col">
+                    <label>Min Item Qty:</label>
+                    <input type="number" id="cashMinQty" value="1">
+                </div>
+                <div class="col">
+                    <label>Max Item Qty:</label>
+                    <input type="number" id="cashMaxQty" value="10">
                 </div>
             </div>
             <div class="row">
