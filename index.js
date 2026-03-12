@@ -9,20 +9,27 @@ function shuffleArray(array) {
     }
 }
 
-function calculateItemTotal(price, qty, gstPercent, cessPercent, mrp) {
-    const base = price * qty;
-    const gstTax = (base * gstPercent) / 100;
-    const cessTax = ((mrp || 0) * qty * (cessPercent || 0)) / 100;
-    return +(base + gstTax + cessTax).toFixed(2);
+// UPDATED MATH: Uses original sales rate for the item price, but taxBasePrice for the tax calculation
+function calculateItemTotal(originalSalesRate, taxBasePrice, qty, gstPercent) {
+    const itemPrice = originalSalesRate * qty;          // F * E
+    const taxBaseAmount = taxBasePrice * qty;          // Used ONLY for tax
+    
+    const halfGst = gstPercent / 2;
+    const cgstAmount = +(taxBaseAmount * halfGst / 100).toFixed(2);
+    const sgstAmount = +(taxBaseAmount * halfGst / 100).toFixed(2);
+    
+    return +(itemPrice + cgstAmount + sgstAmount).toFixed(2);
 }
 
 function calculateTotalStockValue(data, displayElementId) {
     let totalValue = 0;
     data.forEach(item => {
         const qty = parseFloat(item["Qty."]) || 0;
-        const price = parseFloat(item["Price"]) || 0;
-        totalValue += (qty * price);
+        // Reverted to use standard sales rate for stock display, as MRP base is only for tax
+        const basePrice = parseFloat(item["SALES RATE"]) || parseFloat(item["Sales Rate"]) || parseFloat(item["Price"]) || 0;
+        totalValue += (qty * basePrice);
     });
+    
     const displayEl = document.getElementById(displayElementId);
     if (displayEl) {
         displayEl.textContent = `Total Available Stock: ₹ ${totalValue.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -33,24 +40,67 @@ function waitFrame() {
     return new Promise(resolve => setTimeout(resolve, 0));
 }
 
+function formatDisplayDate(dateStr) {
+    if (!dateStr) return "";
+    
+    if (dateStr instanceof Date) {
+        const d = String(dateStr.getDate()).padStart(2, '0');
+        const m = String(dateStr.getMonth() + 1).padStart(2, '0');
+        const y = dateStr.getFullYear();
+        return `${d}/${m}/${y}`;
+    }
+
+    const str = String(dateStr).trim();
+
+    if (/^\d{2}[-/]\d{2}[-/]\d{4}$/.test(str)) {
+        return str.replace(/-/g, '/'); 
+    }
+
+    if (/^\d{4}[-/]\d{2}[-/]\d{2}(T|\s|$)/.test(str)) {
+        const datePart = str.split(/[T\s]/)[0];
+        const parts = datePart.split(/[-/]/);
+        return `${parts[2].padStart(2, '0')}/${parts[1].padStart(2, '0')}/${parts[0]}`;
+    }
+    
+    const parsedDate = new Date(str);
+    if (!isNaN(parsedDate.getTime())) {
+        const d = String(parsedDate.getDate()).padStart(2, '0');
+        const m = String(parsedDate.getMonth() + 1).padStart(2, '0');
+        const y = parsedDate.getFullYear();
+        return `${d}/${m}/${y}`;
+    }
+
+    return String(str);
+}
+
 function buildStockMap(data) {
     const map = new Map();
     for (const item of data) {
         const key = item["Item Details"];
         const qty = Number(item["Qty."]) || 0;
-        
-        // CHECK: Is the input quantity a fraction? (e.g., 1.5)
         const isInputFloat = Math.abs(qty % 1) > 0.0001;
+        const mrp = Number(item["MRP"]) || 0;
+        
+        // Original Sales Rate (Used for F column)
+        const originalSalesRate = Number(item["SALES RATE"]) || Number(item["Sales Rate"]) || Number(item["Price"]) || 0;
+        
+        // Tax Base Price (Used ONLY for calculating taxes)
+        let taxBasePrice = originalSalesRate;
+        if (mrp > 0) {
+            taxBasePrice = (mrp * 100) / 140;
+        }
+
+        const gstPercent = Number(item["GST %"]) || Number(item["GST PERCENT"]) || 0;
 
         map.set(key, {
             ...item,
             remainingQty: qty,
-            originalIsFloat: isInputFloat, // Store this for later checks
-            singleUnitCost: calculateItemTotal(Number(item["Price"]), 1, Number(item["GST PERCENT"]), Number(item["CESS%"]), Number(item["MRP"])),
-            "Price": Number(item["Price"]) || 0,
-            "GST PERCENT": Number(item["GST PERCENT"]) || 0,
-            "CESS%": Number(item["CESS%"]) || 0,
-            "MRP": Number(item["MRP"]) || 0
+            originalIsFloat: isInputFloat, 
+            singleUnitCost: calculateItemTotal(originalSalesRate, taxBasePrice, 1, gstPercent),
+            "OriginalSalesRate": originalSalesRate,
+            "CalculatedTaxBase": taxBasePrice, 
+            "GST PERCENT": gstPercent,
+            "MRP": mrp
         });
     }
     return map;
@@ -58,19 +108,17 @@ function buildStockMap(data) {
 
 function getItemBillTotal(item, qty) {
     return calculateItemTotal(
-        item["Price"],
+        item["OriginalSalesRate"],
+        item["CalculatedTaxBase"],
         qty,
-        item["GST PERCENT"] || 0,
-        item["CESS%"] || 0,
-        item["MRP"] || 0
+        item["GST PERCENT"] || 0
     );
 }
 
-// STRICT FLOAT LOGIC
 function canSellInFloat(item) {
-    if (item["MRP"] > 10000) return true;
+    if (item["MRP"] > 6000 || item.singleUnitCost > 6000) return true;
     if (item.originalIsFloat) return true;
-    return false;
+    return false; 
 }
 
 // ==========================================
@@ -90,8 +138,13 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
     availableItems.sort((a, b) => a.singleUnitCost - b.singleUnitCost);
     freshItems.sort((a, b) => a.singleUnitCost - b.singleUnitCost);
 
-    const expensiveAll = [...availableItems].sort((a, b) => b.singleUnitCost - a.singleUnitCost);
-    const expensiveFresh = [...freshItems].sort((a, b) => b.singleUnitCost - a.singleUnitCost);
+    const splitIndexAll = Math.floor(availableItems.length / 2);
+    const cheapAll = availableItems.slice(0, splitIndexAll);
+    const expensiveAll = availableItems.slice(splitIndexAll);
+
+    const splitIndexFresh = Math.floor(freshItems.length / 2);
+    const cheapFresh = freshItems.slice(0, splitIndexFresh);
+    const expensiveFresh = freshItems.slice(splitIndexFresh);
 
     const itemCount = availableItems.length;
     if (itemCount === 0) return { items: [], total: 0, success: false, reason: "No items" };
@@ -102,10 +155,10 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
     if (currentFailures > 400) effortMultiplier = 0.02; 
 
     const baseAttempts = [
-        { count: 4, attempts: 50 },
-        { count: 3, attempts: 50 },
-        { count: 2, attempts: 100 }, 
-        { count: 1, attempts: 20 }
+        { count: 4, attempts: 200 }, 
+        { count: 3, attempts: 200 }, 
+        { count: 2, attempts: 200 }, 
+        { count: 1, attempts: 50 }
     ];
 
     for (const tier of baseAttempts) {
@@ -114,34 +167,28 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
 
         if (availableItems.length < minItems) continue;
 
-        let minPossibleCost = 0;
-        for(let i=0; i<minItems; i++) minPossibleCost += availableItems[i].singleUnitCost;
-
-        if (minPossibleCost > targetMax && minPossibleCost > dayTotalRemaining) {
-             // Continue
-        }
-
         let selectionPool = [];
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             if (attempt % 50 === 0) await waitFrame();
 
-            let useFreshPool = false;
-            if (attempt < 2 && freshItems.length >= minItems) {
-                useFreshPool = true;
-            }
+            let useFreshPool = (attempt < (maxAttempts * 0.4) && freshItems.length >= minItems);
 
             if (useFreshPool) {
-                if (attempt === 0) selectionPool = expensiveFresh; 
-                else {
-                    selectionPool = [...freshItems];
-                    shuffleArray(selectionPool);
+                if (attempt < (maxAttempts * 0.1)) {
+                    const shEx = [...expensiveFresh]; shuffleArray(shEx);
+                    const shCh = [...cheapFresh]; shuffleArray(shCh);
+                    selectionPool = [...shEx, ...shCh];
+                } else {
+                    selectionPool = [...freshItems]; shuffleArray(selectionPool);
                 }
             } else {
-                if (attempt === 2) selectionPool = expensiveAll;
-                else {
-                    selectionPool = [...availableItems];
-                    shuffleArray(selectionPool);
+                if (attempt === Math.floor(maxAttempts * 0.4)) {
+                    const shEx = [...expensiveAll]; shuffleArray(shEx);
+                    const shCh = [...cheapAll]; shuffleArray(shCh);
+                    selectionPool = [...shEx, ...shCh];
+                } else {
+                    selectionPool = [...availableItems]; shuffleArray(selectionPool);
                 }
             }
 
@@ -157,7 +204,7 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
 
             for (const item of selectionPool) {
                 if (currentTotal >= targetMin && pickedCount >= minItems) {
-                     if (attempt === 0 || attempt === 2 || Math.random() > 0.5) break; 
+                     if (Math.random() > 0.5) break; 
                 }
                 
                 const actualRemaining = getRem(item);
@@ -167,6 +214,7 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
                 if (roomLeft < 1) continue;
 
                 const allowFloat = canSellInFloat(item);
+                
                 if (!allowFloat && item.singleUnitCost > roomLeft) continue;
 
                 let maxQtyBudget = roomLeft / item.singleUnitCost;
@@ -174,15 +222,36 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
                 let qty = 0;
 
                 if (allowFloat) {
-                    if (absMax < 0.01) continue;
-                    let factor = (attempt === 0 || attempt === 2) ? 0.9 : (Math.random() * 0.8 + 0.2);
-                    qty = parseFloat((absMax * factor).toFixed(2));
-                    if (pickedCount < minItems && qty > absMax / 2) {
-                         qty = parseFloat((absMax / 2).toFixed(2));
+                    if (absMax < 0.25 && !item.originalIsFloat) continue; 
+                    
+                    const fracs = [0.25, 0.50, 0.75];
+                    let frac = fracs[Math.floor(Math.random() * fracs.length)];
+                    
+                    let maxInt = Math.floor(absMax);
+                    if (pickedCount < minItems) maxInt = Math.min(maxInt, 1);
+                    
+                    let intPart = maxInt > 0 ? Math.floor(Math.random() * (maxInt + 1)) : 0;
+                    
+                    qty = intPart + frac;
+                    
+                    if (qty > absMax) {
+                        let validFracs = fracs.filter(f => f <= absMax);
+                        if (intPart > 0) {
+                            qty = (intPart - 1) + frac;
+                        } else {
+                            qty = validFracs.length > 0 ? validFracs[validFracs.length - 1] : 0;
+                        }
                     }
+
+                    if (item.originalIsFloat && actualRemaining <= absMax && actualRemaining < 3) {
+                         if (Math.random() > 0.6) qty = actualRemaining; 
+                    }
+
+                    qty = parseFloat(qty.toFixed(2));
                 } else {
                     let intMax = Math.floor(absMax);
-                    if (intMax < 1) continue;
+                    if (intMax < 1) continue; 
+                    
                     if (pickedCount < minItems) intMax = Math.min(intMax, 2);
                     qty = Math.floor(Math.random() * intMax) + 1;
                 }
@@ -221,15 +290,13 @@ async function generateBillFromMap(stockMap, targetMin, targetMax, dayTotalRemai
 
 function formatResult(billArray, total, target, date) {
     const finalItems = billArray.map(entry => {
-        const cessTaxAmount = ((entry.item["MRP"] || 0) * entry.qty * (entry.item["CESS%"] || 0)) / 100;
         return {
             name: entry.item["Item Details"],
-            qty: entry.qty,
-            unitPrice: entry.item["Price"],
+            qty: entry.qty, 
+            originalSalesRate: entry.item["OriginalSalesRate"], // Kept for Col F
+            taxBasePrice: entry.item["CalculatedTaxBase"],      // Used only for Tax
             gstPercent: entry.item["GST PERCENT"],
-            cessPercent: entry.item["CESS%"],
             mrp: entry.item["MRP"],
-            cessTaxAmount: cessTaxAmount,
             itemTotal: entry.cost,
             date: date
         };
@@ -242,6 +309,11 @@ function formatResult(billArray, total, target, date) {
 // ==========================================
 
 function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
+    if (!bills || bills.length === 0) {
+        alert("Warning: No valid bills generated. Excel file will not be created.");
+        return;
+    }
+
     const prefixElement = document.getElementById(prefixId);
     const indexElement = document.getElementById(indexId);
     const prefix = prefixElement ? prefixElement.value : "BILL";
@@ -272,35 +344,47 @@ function exportBillsToExcel(bills, filename, prefixId, indexId, paymentMethod) {
 
         bill.items.forEach(item => {
             const billNo = generateBillNumber(index + startIndex, prefix);
-            const taxAmount = item.itemTotal - (item.unitPrice * item.qty) - (item.cessTaxAmount || 0);
             
-            // Calculate CGST and SGST
+            const qty = item.qty || 0;
+            const originalSalesRate = item.originalSalesRate || 0;
+            const taxBasePrice = item.taxBasePrice || 0;
+            
+            // F * E exactly
+            const itemPrice = +(originalSalesRate * qty).toFixed(2); 
+            
+            // Tax base is different only if MRP > 0
+            const taxBaseAmount = taxBasePrice * qty;
+            
             const gstRate = item.gstPercent || 0;
             const cgstRate = gstRate / 2;
             const sgstRate = gstRate / 2;
-            const cgstAmount = taxAmount / 2;
-            const sgstAmount = taxAmount / 2;
+            
+            const cgstAmount = +(taxBaseAmount * (cgstRate / 100)).toFixed(2);
+            const sgstAmount = +(taxBaseAmount * (sgstRate / 100)).toFixed(2);
+            const taxAmount = +(cgstAmount + sgstAmount).toFixed(2);
+            
+            // Final calculation for this specific row item
+            const finalCalculatedItemTotal = +(itemPrice + taxAmount).toFixed(2);
 
             rows.push({
-                "Bill No": billNo,
-                "Purchaser Name": billPurchaserName, 
-                "Payment Method": paymentMethod, 
-                "Item Name": item.name,
-                "Quantity": item.qty,
-                "Unit Price": item.unitPrice,
-                "Item Price": +(item.unitPrice * item.qty).toFixed(2),
-                "GST %": gstRate,
-                "CGST %": cgstRate,
-                "CGST Amount": +(cgstAmount).toFixed(2),
-                "SGST %": sgstRate,
-                "SGST Amount": +(sgstAmount).toFixed(2),
-                "Total Tax Amount": +(taxAmount).toFixed(2),
-                "CESS Tax Amount": +(item.cessTaxAmount || 0).toFixed(2),
-                "Date": formatDisplayDate(item.date),
-                "Item Total": item.itemTotal,
-                "Bill Total (Unrounded)": bill.total,
-                "Round off": roundOff, 
-                "Bill Total (Final)": finalBillTotal, 
+                "Bill No": String(billNo),
+                "Purchaser Name": String(billPurchaserName), 
+                "Payment Method": String(paymentMethod), 
+                "Item Name": String(item.name),
+                "Quantity": Number(qty),
+                "Unit Price": Number(originalSalesRate),     // Strictly Original Sales Rate
+                "Item Price": Number(itemPrice),             // Strictly Unit Price * Quantity
+                "GST %": Number(gstRate),
+                "CGST %": Number(cgstRate),
+                "CGST Amount": Number(cgstAmount),
+                "SGST %": Number(sgstRate),
+                "SGST Amount": Number(sgstAmount),
+                "Total Tax Amount": Number(taxAmount),
+                "Date": String(formatDisplayDate(item.date)),
+                "Item Total": Number(finalCalculatedItemTotal), 
+                "Bill Total (Unrounded)": Number(bill.total),
+                "Round off": Number(roundOff), 
+                "Bill Total (Final)": Number(finalBillTotal), 
             });
         });
     });
@@ -315,13 +399,13 @@ function exportUpdatedStockToXLSX(stockMap, filename) {
     const updatedStock = [];
     for (const [_, item] of stockMap.entries()) {
         updatedStock.push({
-            "Item Details": item["Item Details"],
-            "Qty.": item.remainingQty, 
-            "Unit": item["Unit"],
-            "Price": item["Price"],
-            "GST PERCENT": item["GST PERCENT"],
-            "MRP": item["MRP"],
-            "Amount": +(item.remainingQty * item["Price"]).toFixed(2),
+            "Item Details": String(item["Item Details"]),
+            "Qty.": Number(item.remainingQty) || 0, 
+            "Unit": String(item["Unit"] || ""),
+            "Price": Number(item["OriginalSalesRate"]) || 0, // Keep original stock price structure
+            "GST %": Number(item["GST PERCENT"]) || 0,
+            "MRP": Number(item["MRP"]) || 0,
+            "Amount": +(item.remainingQty * item["OriginalSalesRate"]).toFixed(2),
         });
     }
     const ws = XLSX.utils.json_to_sheet(updatedStock);
@@ -332,12 +416,6 @@ function exportUpdatedStockToXLSX(stockMap, filename) {
 
 function generateBillNumber(index, prefix = "BILL", padLength = 4) {
     return `${prefix}${String(index).padStart(padLength, '0')}`;
-}
-
-function formatDisplayDate(dateStr) {
-    if (!dateStr || dateStr.length !== 10) return dateStr;
-    const parts = dateStr.split('-');
-    return `${parts[2]}/${parts[1]}/${parts[0]}`;
 }
 
 function formatDate(dateInput) {
@@ -444,7 +522,7 @@ function handleStockFile(file) {
     const reader = new FileReader();
     reader.onload = evt => {
         const data = evt.target.result;
-        const workbook = XLSX.read(data, { type: 'binary' });
+        const workbook = XLSX.read(data, { type: 'binary', cellDates: true });
         stockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         calculateTotalStockValue(stockData, "upiStockTotal"); 
         updateGenerateButtonState();
@@ -456,7 +534,7 @@ function handleBillAmountFile(file) {
     const reader = new FileReader();
     reader.onload = evt => {
         const data = evt.target.result;
-        const workbook = XLSX.read(data, { type: 'binary' });
+        const workbook = XLSX.read(data, { type: 'binary', cellDates: true });
         billTargets = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         updateGenerateButtonState();
     };
@@ -467,7 +545,7 @@ function handleCashStockFile(file) {
     const reader = new FileReader();
     reader.onload = evt => {
         const data = evt.target.result;
-        const workbook = XLSX.read(data, { type: 'binary' });
+        const workbook = XLSX.read(data, { type: 'binary', cellDates: true });
         cashStockData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
         calculateTotalStockValue(cashStockData, "cashStockTotal");
         updateGenerateCashButtonState();
@@ -489,10 +567,10 @@ function handlePurchaserNamesFile(file) {
     reader.readAsBinaryString(file);
 }
 
-// --- UPI GENERATION LOGIC (RESTORED) ---
+// --- ROBUST UPI GENERATOR ---
 async function tryGenerateAllBills() {
     if (!stockData || !billTargets) return;
-    
+
     const btn = document.getElementById("generateBtn");
     const originalText = btn.textContent;
     btn.disabled = true;
@@ -500,19 +578,35 @@ async function tryGenerateAllBills() {
 
     const stockMap = buildStockMap(stockData);
     const bills = [];
-    
-    // Create a Set to track rotation for UPI as well
     const upiUsedItemIds = new Set();
 
     for (const amountObj of billTargets) {
-        const values = Object.values(amountObj);
-        const target = parseFloat(values[0]);
-        const date = values[1]; 
-        
-        if (isNaN(target) || !date) continue;
-        
-        // Use EXACT mode for UPI
-        const bill = await generateBillFromMap(stockMap, target, target, target, date, 5, 'EXACT', 0, upiUsedItemIds);
+        let target = null;
+        let dateStr = null;
+
+        for (const [key, val] of Object.entries(amountObj)) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey.includes('amount') || lowerKey.includes('target') || lowerKey.includes('bill') || lowerKey.includes('upi')) {
+                target = parseFloat(val);
+            } else if (lowerKey.includes('date')) {
+                dateStr = val;
+            }
+        }
+
+        if (target === null || dateStr === null) {
+            const values = Object.values(amountObj);
+            if (values[0] instanceof Date || String(values[0]).includes('/') || String(values[0]).includes('-')) {
+                dateStr = values[0];
+                target = parseFloat(values[1]);
+            } else {
+                target = parseFloat(values[0]);
+                dateStr = values[1];
+            }
+        }
+
+        if (isNaN(target) || !dateStr) continue;
+
+        let bill = await generateBillFromMap(stockMap, target, target, target, dateStr, 2, 'EXACT', 0, upiUsedItemIds);
         
         if (bill.success) {
             bills.push(bill);
@@ -525,15 +619,23 @@ async function tryGenerateAllBills() {
             }
         }
     }
-    
+
+    if (bills.length === 0) {
+        alert("Failed to generate any UPI bills! Check if your stock is too expensive for the requested bill amounts.");
+        btn.textContent = originalText;
+        btn.disabled = false;
+        return;
+    }
+
     const today = formatDate(new Date());
     exportBillsToExcel(bills, `generated-upi-bills-${today}.xlsx`, "billPrefix", "startIndex", "UPI");
     exportUpdatedStockToXLSX(stockMap, `updated-upi-stock-${today}.xlsx`);
-    
+
     btn.textContent = originalText;
     btn.disabled = false;
     alert("UPI Bills Generated Successfully!");
 }
+
 
 // --- MAIN CASH LOGIC ---
 async function tryGenerateCashBills() {
@@ -559,6 +661,7 @@ async function tryGenerateCashBills() {
     const allGeneratedBills = [];
     let hasSkipped = false;
     
+    let last3BillAmounts = [];
     let purchaserHistory = {}; 
     const availablePurchasers = purchaserNames.length > 0 ? [...purchaserNames] : ['N/A'];
 
@@ -570,7 +673,7 @@ async function tryGenerateCashBills() {
         let consecutiveFailures = 0; 
         
         let todaysBills = [];
-        let dailyUsedItemIds = new Set(); // Reset rotation daily
+        let dailyUsedItemIds = new Set(); 
 
         console.log(`Processing Date: ${date} | Target: ${targetAmount}`);
 
@@ -627,6 +730,9 @@ async function tryGenerateCashBills() {
                         dailyUsedItemIds.add(name);
                     }
                 }
+
+                last3BillAmounts.push(bill.total);
+                if (last3BillAmounts.length > 3) last3BillAmounts.shift(); 
 
                 todaysBills.push(bill);
                 dateAccumulated += bill.total;
@@ -699,6 +805,13 @@ async function tryGenerateCashBills() {
                 allGeneratedBills.push(b);
             }
         }
+    }
+
+    if (allGeneratedBills.length === 0) {
+         alert("Error: No bills were generated at all. Please check your targets and stock.");
+         btn.textContent = originalText;
+         btn.disabled = false;
+         return;
     }
 
     const today = formatDate(new Date());
